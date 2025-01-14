@@ -1,30 +1,9 @@
 /*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2011-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #include "server.h"
@@ -38,14 +17,20 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#if defined(USE_JEMALLOC)
+#include <lstate.h>
+#endif
 #include <ctype.h>
 #include <math.h>
+
+static int gc_count = 0; /* Counter for the number of GC requests, reset after each GC execution */
 
 void ldbInit(void);
 void ldbDisable(client *c);
 void ldbEnable(client *c);
 void evalGenericCommandWithDebugging(client *c, int evalsha);
 sds ldbCatStackValue(sds s, lua_State *lua, int idx);
+listNode *luaScriptsLRUAdd(client *c, sds sha, int evalsha);
 
 static void dictLuaScriptDestructor(dict *d, void *val) {
     UNUSED(d);
@@ -58,7 +43,7 @@ static uint64_t dictStrCaseHash(const void *key) {
     return dictGenCaseHashFunction((unsigned char*)key, strlen((char*)key));
 }
 
-/* server.lua_scripts sha (as sds string) -> scripts (as luaScript) cache. */
+/* lctx.lua_scripts sha (as sds string) -> scripts (as luaScript) cache. */
 dictType shaScriptObjectDictType = {
         dictStrCaseHash,            /* hash function */
         NULL,                       /* key dup */
@@ -74,6 +59,7 @@ struct luaCtx {
     lua_State *lua; /* The Lua interpreter. We use just one for all clients */
     client *lua_client;   /* The "fake client" to query Redis from Lua */
     dict *lua_scripts;         /* A dictionary of SHA1 -> Lua scripts */
+    list *lua_scripts_lru_list; /* A list of SHA1, first in first out LRU eviction. */
     unsigned long long lua_scripts_mem;  /* Cached scripts' memory + oh */
 } lctx;
 
@@ -107,7 +93,7 @@ struct ldbState {
  * bodies in order to obtain the Lua function name, and in the implementation
  * of redis.sha1().
  *
- * 'digest' should point to a 41 bytes buffer: 40 for SHA1 converted into an
+ * 'digest' should point to a 41 bytes buffer: 40 for SHA1 converted into a
  * hexadecimal number, plus 1 byte for null term. */
 void sha1hex(char *digest, char *script, size_t len) {
     SHA1_CTX ctx;
@@ -181,19 +167,23 @@ int luaRedisReplicateCommandsCommand(lua_State *lua) {
  *
  * However it is simpler to just call scriptingReset() that does just that. */
 void scriptingInit(int setup) {
-    lua_State *lua = lua_open();
-
     if (setup) {
         lctx.lua_client = NULL;
-        server.script_caller = NULL;
         server.script_disable_deny_script = 0;
         ldbInit();
     }
 
+    lua_State *lua = createLuaState();
+    if (lua == NULL) {
+        serverLog(LL_WARNING, "Failed creating the lua VM.");
+        exit(1);
+    }
+
     /* Initialize a dictionary we use to map SHAs to scripts.
-     * This is useful for replication, as we need to replicate EVALSHA
-     * as EVAL, so we need to remember the associated script. */
+     * Initialize a list we use for lua script evictions, it shares the
+     * sha with the dictionary, so free fn is not set. */
     lctx.lua_scripts = dictCreate(&shaScriptObjectDictType);
+    lctx.lua_scripts_lru_list = listCreate();
     lctx.lua_scripts_mem = 0;
 
     luaRegisterRedisAPI(lua);
@@ -218,31 +208,20 @@ void scriptingInit(int setup) {
 
     lua_setglobal(lua,"redis");
 
-    /* Add a helper function that we use to sort the multi bulk output of non
-     * deterministic commands, when containing 'false' elements. */
-    {
-        char *compare_func =    "function __redis__compare_helper(a,b)\n"
-                                "  if a == false then a = '' end\n"
-                                "  if b == false then b = '' end\n"
-                                "  return a<b\n"
-                                "end\n";
-        luaL_loadbuffer(lua,compare_func,strlen(compare_func),"@cmp_func_def");
-        lua_pcall(lua,0,0,0);
-    }
-
     /* Add a helper function we use for pcall error reporting.
      * Note that when the error is in the C function we want to report the
      * information about the caller, that's what makes sense from the point
      * of view of the user debugging a script. */
     {
         char *errh_func =       "local dbg = debug\n"
+                                "debug = nil\n"
                                 "function __redis__err__handler(err)\n"
                                 "  local i = dbg.getinfo(2,'nSl')\n"
                                 "  if i and i.what == 'C' then\n"
                                 "    i = dbg.getinfo(3,'nSl')\n"
                                 "  end\n"
                                 "  if type(err) ~= 'table' then\n"
-                                "    err = {err='ERR' .. tostring(err)}"
+                                "    err = {err='ERR ' .. tostring(err)}"
                                 "  end"
                                 "  if i then\n"
                                 "    err['source'] = i.source\n"
@@ -266,23 +245,42 @@ void scriptingInit(int setup) {
         lctx.lua_client->flags |= CLIENT_DENY_BLOCKING;
     }
 
-    /* Lua beginners often don't use "local", this is likely to introduce
-     * subtle bugs in their code. To prevent problems we protect accesses
-     * to global variables. */
-    luaEnableGlobalsProtection(lua, 1);
+    /* Lock the global table from any changes */
+    lua_pushvalue(lua, LUA_GLOBALSINDEX);
+    luaSetErrorMetatable(lua);
+    /* Recursively lock all tables that can be reached from the global table */
+    luaSetTableProtectionRecursively(lua);
+    lua_pop(lua, 1);
 
     lctx.lua = lua;
+}
+
+/* Free lua_scripts dict and close lua interpreter. */
+void freeLuaScriptsSync(dict *lua_scripts, list *lua_scripts_lru_list, lua_State *lua) {
+    dictRelease(lua_scripts);
+    listRelease(lua_scripts_lru_list);
+
+#if defined(USE_JEMALLOC)
+    /* When lua is closed, destroy the previously used private tcache. */
+    void *ud = (global_State*)G(lua)->ud;
+    unsigned int lua_tcache = (unsigned int)(uintptr_t)ud;
+#endif
+
+    lua_gc(lua, LUA_GCCOLLECT, 0);
+    lua_close(lua);
+
+#if defined(USE_JEMALLOC)
+    je_mallctl("tcache.destroy", NULL, NULL, (void *)&lua_tcache, sizeof(unsigned int));
+#endif
 }
 
 /* Release resources related to Lua scripting.
  * This function is used in order to reset the scripting environment. */
 void scriptingRelease(int async) {
     if (async)
-        freeLuaScriptsAsync(lctx.lua_scripts);
+        freeLuaScriptsAsync(lctx.lua_scripts, lctx.lua_scripts_lru_list, lctx.lua);
     else
-        dictRelease(lctx.lua_scripts);
-    lctx.lua_scripts_mem = 0;
-    lua_close(lctx.lua);
+        freeLuaScriptsSync(lctx.lua_scripts, lctx.lua_scripts_lru_list, lctx.lua);
 }
 
 void scriptingReset(int async) {
@@ -293,6 +291,124 @@ void scriptingReset(int async) {
 /* ---------------------------------------------------------------------------
  * EVAL and SCRIPT commands implementation
  * ------------------------------------------------------------------------- */
+
+static void evalCalcFunctionName(int evalsha, sds script, char *out_funcname) {
+    /* We obtain the script SHA1, then check if this function is already
+     * defined into the Lua state */
+    out_funcname[0] = 'f';
+    out_funcname[1] = '_';
+    if (!evalsha) {
+        /* Hash the code if this is an EVAL call */
+        sha1hex(out_funcname+2,script,sdslen(script));
+    } else {
+        /* We already have the SHA if it is an EVALSHA */
+        int j;
+        char *sha = script;
+
+        /* Convert to lowercase. We don't use tolower since the function
+         * managed to always show up in the profiler output consuming
+         * a non trivial amount of time. */
+        for (j = 0; j < 40; j++)
+            out_funcname[j+2] = (sha[j] >= 'A' && sha[j] <= 'Z') ?
+                sha[j]+('a'-'A') : sha[j];
+        out_funcname[42] = '\0';
+    }
+}
+
+/* Helper function to try and extract shebang flags from the script body.
+ * If no shebang is found, return with success and COMPAT mode flag.
+ * The err arg is optional, can be used to get a detailed error string.
+ * The out_shebang_len arg is optional, can be used to trim the shebang from the script.
+ * Returns C_OK on success, and C_ERR on error. */
+int evalExtractShebangFlags(sds body, uint64_t *out_flags, ssize_t *out_shebang_len, sds *err) {
+    ssize_t shebang_len = 0;
+    uint64_t script_flags = SCRIPT_FLAG_EVAL_COMPAT_MODE;
+    if (!strncmp(body, "#!", 2)) {
+        int numparts,j;
+        char *shebang_end = strchr(body, '\n');
+        if (shebang_end == NULL) {
+            if (err)
+                *err = sdsnew("Invalid script shebang");
+            return C_ERR;
+        }
+        shebang_len = shebang_end - body;
+        sds shebang = sdsnewlen(body, shebang_len);
+        sds *parts = sdssplitargs(shebang, &numparts);
+        sdsfree(shebang);
+        if (!parts || numparts == 0) {
+            if (err)
+                *err = sdsnew("Invalid engine in script shebang");
+            sdsfreesplitres(parts, numparts);
+            return C_ERR;
+        }
+        /* Verify lua interpreter was specified */
+        if (strcmp(parts[0], "#!lua")) {
+            if (err)
+                *err = sdscatfmt(sdsempty(), "Unexpected engine in script shebang: %s", parts[0]);
+            sdsfreesplitres(parts, numparts);
+            return C_ERR;
+        }
+        script_flags &= ~SCRIPT_FLAG_EVAL_COMPAT_MODE;
+        for (j = 1; j < numparts; j++) {
+            if (!strncmp(parts[j], "flags=", 6)) {
+                sdsrange(parts[j], 6, -1);
+                int numflags, jj;
+                sds *flags = sdssplitlen(parts[j], sdslen(parts[j]), ",", 1, &numflags);
+                for (jj = 0; jj < numflags; jj++) {
+                    scriptFlag *sf;
+                    for (sf = scripts_flags_def; sf->flag; sf++) {
+                        if (!strcmp(flags[jj], sf->str)) break;
+                    }
+                    if (!sf->flag) {
+                        if (err)
+                            *err = sdscatfmt(sdsempty(), "Unexpected flag in script shebang: %s", flags[jj]);
+                        sdsfreesplitres(flags, numflags);
+                        sdsfreesplitres(parts, numparts);
+                        return C_ERR;
+                    }
+                    script_flags |= sf->flag;
+                }
+                sdsfreesplitres(flags, numflags);
+            } else {
+                /* We only support function flags options for lua scripts */
+                if (err)
+                    *err = sdscatfmt(sdsempty(), "Unknown lua shebang option: %s", parts[j]);
+                sdsfreesplitres(parts, numparts);
+                return C_ERR;
+            }
+        }
+        sdsfreesplitres(parts, numparts);
+    }
+    if (out_shebang_len)
+        *out_shebang_len = shebang_len;
+    *out_flags = script_flags;
+    return C_OK;
+}
+
+/* Try to extract command flags if we can, returns the modified flags.
+ * Note that it does not guarantee the command arguments are right. */
+uint64_t evalGetCommandFlags(client *c, uint64_t cmd_flags) {
+    char funcname[43];
+    int evalsha = c->cmd->proc == evalShaCommand || c->cmd->proc == evalShaRoCommand;
+    if (evalsha && sdslen(c->argv[1]->ptr) != 40)
+        return cmd_flags;
+    uint64_t script_flags;
+    evalCalcFunctionName(evalsha, c->argv[1]->ptr, funcname);
+    char *lua_cur_script = funcname + 2;
+    c->cur_script = dictFind(lctx.lua_scripts, lua_cur_script);
+    if (!c->cur_script) {
+        if (evalsha)
+            return cmd_flags;
+        if (evalExtractShebangFlags(c->argv[1]->ptr, &script_flags, NULL, NULL) == C_ERR)
+            return cmd_flags;
+    } else {
+        luaScript *l = dictGetVal(c->cur_script);
+        script_flags = l->flags;
+    }
+    if (script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE)
+        return cmd_flags;
+    return scriptFlagsToCmdFlags(cmd_flags, script_flags);
+}
 
 /* Define a Lua function with the specified body.
  * The function name will be generated in the following form:
@@ -310,11 +426,14 @@ void scriptingReset(int async) {
  * exists, and in such a case, it behaves like in the success case.
  *
  * If 'c' is not NULL, on error the client is informed with an appropriate
- * error describing the nature of the problem and the Lua interpreter error. */
-sds luaCreateFunction(client *c, robj *body) {
+ * error describing the nature of the problem and the Lua interpreter error.
+ *
+ * 'evalsha' indicating whether the lua function is created from the EVAL context
+ * or from the SCRIPT LOAD. */
+sds luaCreateFunction(client *c, robj *body, int evalsha) {
     char funcname[43];
     dictEntry *de;
-    uint64_t script_flags = SCRIPT_FLAG_EVAL_COMPAT_MODE;
+    uint64_t script_flags;
 
     funcname[0] = 'f';
     funcname[1] = '_';
@@ -326,87 +445,29 @@ sds luaCreateFunction(client *c, robj *body) {
 
     /* Handle shebang header in script code */
     ssize_t shebang_len = 0;
-    if (!strncmp(body->ptr, "#!", 2)) {
-        int numparts,j;
-        char *shebang_end = strchr(body->ptr, '\n');
-        if (shebang_end == NULL) {
-            addReplyError(c,"Invalid script shebang");
-            return NULL;
+    sds err = NULL;
+    if (evalExtractShebangFlags(body->ptr, &script_flags, &shebang_len, &err) == C_ERR) {
+        if (c != NULL) {
+            addReplyErrorSds(c, err);
         }
-        shebang_len = shebang_end - (char*)body->ptr;
-        sds shebang = sdsnewlen(body->ptr, shebang_len);
-        sds *parts = sdssplitargs(shebang, &numparts);
-        sdsfree(shebang);
-        if (!parts || numparts == 0) {
-            addReplyError(c,"Invalid engine in script shebang");
-            sdsfreesplitres(parts, numparts);
-            return NULL;
-        }
-        /* Verify lua interpreter was specified */
-        if (strcmp(parts[0], "#!lua")) {
-            addReplyErrorFormat(c,"Unexpected engine in script shebang: %s", parts[0]);
-            sdsfreesplitres(parts, numparts);
-            return NULL;
-        }
-        script_flags &= ~SCRIPT_FLAG_EVAL_COMPAT_MODE;
-        for (j = 1; j < numparts; j++) {
-            if (!strncmp(parts[j], "flags=", 6)) {
-                sdsrange(parts[j], 6, -1);
-                int numflags, jj;
-                sds *flags = sdssplitlen(parts[j], sdslen(parts[j]), ",", 1, &numflags);
-                for (jj = 0; jj < numflags; jj++) {
-                    scriptFlag *sf;
-                    for (sf = scripts_flags_def; sf->flag; sf++) {
-                        if (!strcmp(flags[jj], sf->str)) break;
-                    }
-                    if (!sf->flag) {
-                        addReplyErrorFormat(c,"Unexpected flag in script shebang: %s", flags[jj]);
-                        sdsfreesplitres(flags, numflags);
-                        sdsfreesplitres(parts, numparts);
-                        return NULL;
-                    }
-                    script_flags |= sf->flag;
-                }
-                sdsfreesplitres(flags, numflags);
-            } else {
-                /* We only support function flags options for lua scripts */
-                addReplyErrorFormat(c,"Unknown lua shebang option: %s", parts[j]);
-                sdsfreesplitres(parts, numparts);
-                return NULL;
-            }
-        }
-        sdsfreesplitres(parts, numparts);
+        return NULL;
     }
 
-    /* Build the lua function to be loaded */
-    sds funcdef = sdsempty();
-    funcdef = sdscat(funcdef,"function ");
-    funcdef = sdscatlen(funcdef,funcname,42);
-    funcdef = sdscatlen(funcdef,"() ",3);
     /* Note that in case of a shebang line we skip it but keep the line feed to conserve the user's line numbers */
-    funcdef = sdscatlen(funcdef,(char*)body->ptr + shebang_len,sdslen(body->ptr) - shebang_len);
-    funcdef = sdscatlen(funcdef,"\nend",4);
-
-    if (luaL_loadbuffer(lctx.lua,funcdef,sdslen(funcdef),"@user_script")) {
+    if (luaL_loadbuffer(lctx.lua,(char*)body->ptr + shebang_len,sdslen(body->ptr) - shebang_len,"@user_script")) {
         if (c != NULL) {
             addReplyErrorFormat(c,
                 "Error compiling script (new function): %s",
                 lua_tostring(lctx.lua,-1));
         }
         lua_pop(lctx.lua,1);
-        sdsfree(funcdef);
+        luaGC(lctx.lua, &gc_count);
         return NULL;
     }
-    sdsfree(funcdef);
 
-    if (lua_pcall(lctx.lua,0,0,0)) {
-        if (c != NULL) {
-            addReplyErrorFormat(c,"Error running script (new function): %s",
-                lua_tostring(lctx.lua,-1));
-        }
-        lua_pop(lctx.lua,1);
-        return NULL;
-    }
+    serverAssert(lua_isfunction(lctx.lua, -1));
+
+    lua_setfield(lctx.lua, LUA_REGISTRYINDEX, funcname);
 
     /* We also save a SHA1 -> Original script map in a dictionary
      * so that we can replicate / write in the AOF all the
@@ -415,27 +476,74 @@ sds luaCreateFunction(client *c, robj *body) {
     l->body = body;
     l->flags = script_flags;
     sds sha = sdsnewlen(funcname+2,40);
+    l->node = luaScriptsLRUAdd(c, sha, evalsha);
     int retval = dictAdd(lctx.lua_scripts,sha,l);
     serverAssertWithInfo(c ? c : lctx.lua_client,NULL,retval == DICT_OK);
     lctx.lua_scripts_mem += sdsZmallocSize(sha) + getStringObjectSdsUsedMemory(body);
     incrRefCount(body);
+
+    /* Perform GC after creating the script and adding it to the LRU list,
+     * as script may be evicted during addition. */
+    luaGC(lctx.lua, &gc_count);
+
     return sha;
 }
 
-void prepareLuaClient(void) {
-    /* Select the right DB in the context of the Lua client */
-    selectDb(lctx.lua_client,server.script_caller->db->id);
-    lctx.lua_client->resp = 2; /* Default is RESP2, scripts can change it. */
+/* Delete a Lua function with the specified sha.
+ *
+ * This will delete the lua function from the lua interpreter and delete
+ * the lua function from server. */
+void luaDeleteFunction(client *c, sds sha) {
+    /* Delete the script from lua interpreter. */
+    char funcname[43];
+    funcname[0] = 'f';
+    funcname[1] = '_';
+    memcpy(funcname+2, sha, 40);
+    funcname[42] = '\0';
+    lua_pushnil(lctx.lua);
+    lua_setfield(lctx.lua, LUA_REGISTRYINDEX, funcname);
 
-    /* If we are in MULTI context, flag Lua client as CLIENT_MULTI. */
-    if (server.script_caller->flags & CLIENT_MULTI) {
-        lctx.lua_client->flags |= CLIENT_MULTI;
-    }
+    /* Delete the script from server. */
+    dictEntry *de = dictUnlink(lctx.lua_scripts, sha);
+    serverAssertWithInfo(c ? c : lctx.lua_client, NULL, de);
+    luaScript *l = dictGetVal(de);
+    /* We only delete `EVAL` scripts, which must exist in the LRU list. */
+    serverAssert(l->node);
+    listDelNode(lctx.lua_scripts_lru_list, l->node);
+    lctx.lua_scripts_mem -= sdsZmallocSize(sha) + getStringObjectSdsUsedMemory(l->body);
+    dictFreeUnlinkedEntry(lctx.lua_scripts, de);
 }
 
-void resetLuaClient(void) {
-    /* After the script done, remove the MULTI state. */
-    lctx.lua_client->flags &= ~CLIENT_MULTI;
+/* Users who abuse EVAL will generate a new lua script on each call, which can
+ * consume large amounts of memory over time. Since EVAL is mostly the one that
+ * abuses the lua cache, and these won't have pipeline issues (scripts won't
+ * disappear when EVALSHA needs it and cause failure), we implement script eviction
+ * only for these (not for one loaded with SCRIPT LOAD). Considering that we don't
+ * have many scripts, then unlike keys, we don't need to worry about the memory
+ * usage of keeping a true sorted LRU linked list.
+ *
+ * 'evalsha' indicating whether the lua function is added from the EVAL context
+ * or from the SCRIPT LOAD.
+ *
+ * Returns the corresponding node added, which is used to save it in luaScript
+ * and use it for quick removal and re-insertion into an LRU list each time the
+ * script is used. */
+#define LRU_LIST_LENGTH 500
+listNode *luaScriptsLRUAdd(client *c, sds sha, int evalsha) {
+    /* Script eviction only applies to EVAL, not SCRIPT LOAD. */
+    if (evalsha) return NULL;
+
+    /* Evict oldest. */
+    while (listLength(lctx.lua_scripts_lru_list) >= LRU_LIST_LENGTH) {
+        listNode *ln = listFirst(lctx.lua_scripts_lru_list);
+        sds oldest = listNodeValue(ln);
+        luaDeleteFunction(c, oldest);
+        server.stat_evictedscripts++;
+    }
+
+    /* Add current. */
+    listAddNodeTail(lctx.lua_scripts_lru_list, sha);
+    return listLast(lctx.lua_scripts_lru_list);
 }
 
 void evalGenericCommand(client *c, int evalsha) {
@@ -454,32 +562,18 @@ void evalGenericCommand(client *c, int evalsha) {
         return;
     }
 
-    /* We obtain the script SHA1, then check if this function is already
-     * defined into the Lua state */
-    funcname[0] = 'f';
-    funcname[1] = '_';
-    if (!evalsha) {
-        /* Hash the code if this is an EVAL call */
-        sha1hex(funcname+2,c->argv[1]->ptr,sdslen(c->argv[1]->ptr));
-    } else {
-        /* We already have the SHA if it is an EVALSHA */
-        int j;
-        char *sha = c->argv[1]->ptr;
-
-        /* Convert to lowercase. We don't use tolower since the function
-         * managed to always show up in the profiler output consuming
-         * a non trivial amount of time. */
-        for (j = 0; j < 40; j++)
-            funcname[j+2] = (sha[j] >= 'A' && sha[j] <= 'Z') ?
-                sha[j]+('a'-'A') : sha[j];
+    if (c->cur_script) {
+        funcname[0] = 'f', funcname[1] = '_';
+        memcpy(funcname+2, dictGetKey(c->cur_script), 40);
         funcname[42] = '\0';
-    }
+    } else
+        evalCalcFunctionName(evalsha, c->argv[1]->ptr, funcname);
 
     /* Push the pcall error handler function on the stack. */
     lua_getglobal(lua, "__redis__err__handler");
 
     /* Try to lookup the Lua function */
-    lua_getglobal(lua, funcname);
+    lua_getfield(lua, LUA_REGISTRYINDEX, funcname);
     if (lua_isnil(lua,-1)) {
         lua_pop(lua,1); /* remove the nil from the stack */
         /* Function not defined... let's define it if we have the
@@ -490,19 +584,21 @@ void evalGenericCommand(client *c, int evalsha) {
             addReplyErrorObject(c, shared.noscripterr);
             return;
         }
-        if (luaCreateFunction(c,c->argv[1]) == NULL) {
+        if (luaCreateFunction(c, c->argv[1], evalsha) == NULL) {
             lua_pop(lua,1); /* remove the error handler from the stack. */
             /* The error is sent to the client by luaCreateFunction()
              * itself when it returns NULL. */
             return;
         }
         /* Now the following is guaranteed to return non nil */
-        lua_getglobal(lua, funcname);
+        lua_getfield(lua, LUA_REGISTRYINDEX, funcname);
         serverAssert(!lua_isnil(lua,-1));
     }
 
     char *lua_cur_script = funcname + 2;
-    dictEntry *de = dictFind(lctx.lua_scripts, lua_cur_script);
+    dictEntry *de = c->cur_script;
+    if (!de)
+        de = dictFind(lctx.lua_scripts, lua_cur_script);
     luaScript *l = dictGetVal(de);
     int ro = c->cmd->proc == evalRoCommand || c->cmd->proc == evalShaRoCommand;
 
@@ -517,6 +613,14 @@ void evalGenericCommand(client *c, int evalsha) {
     luaCallFunction(&rctx, lua, c->argv+3, numkeys, c->argv+3+numkeys, c->argc-3-numkeys, ldb.active);
     lua_pop(lua,1); /* Remove the error handler. */
     scriptResetRun(&rctx);
+    luaGC(lua, &gc_count);
+
+    if (l->node) {
+        /* Quick removal and re-insertion after the script is called to
+         * maintain the LRU list. */
+        listUnlinkNode(lctx.lua_scripts_lru_list, l->node);
+        listLinkNodeTail(lctx.lua_scripts_lru_list, l->node);
+    }
 }
 
 void evalCommand(client *c) {
@@ -602,7 +706,7 @@ NULL
                 addReply(c,shared.czero);
         }
     } else if (c->argc == 3 && !strcasecmp(c->argv[1]->ptr,"load")) {
-        sds sha = luaCreateFunction(c,c->argv[2]);
+        sds sha = luaCreateFunction(c, c->argv[2], 1);
         if (sha == NULL) return; /* The error was sent by luaCreateFunction(). */
         addReplyBulkCBuffer(c,sha,40);
     } else if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"kill")) {
@@ -631,18 +735,19 @@ NULL
     }
 }
 
-unsigned long evalMemory() {
+unsigned long evalScriptsMemoryVM(void) {
     return luaMemory(lctx.lua);
 }
 
-dict* evalScriptsDict() {
+dict* evalScriptsDict(void) {
     return lctx.lua_scripts;
 }
 
-unsigned long evalScriptsMemory() {
+unsigned long evalScriptsMemoryEngine(void) {
     return lctx.lua_scripts_mem +
-            dictSize(lctx.lua_scripts) * (sizeof(dictEntry) + sizeof(luaScript)) +
-            dictSlots(lctx.lua_scripts) * sizeof(dictEntry*);
+            dictMemUsage(lctx.lua_scripts) +
+            dictSize(lctx.lua_scripts) * sizeof(luaScript) +
+            listLength(lctx.lua_scripts_lru_list) * sizeof(listNode);
 }
 
 /* ---------------------------------------------------------------------------
@@ -654,7 +759,7 @@ void ldbInit(void) {
     ldb.conn = NULL;
     ldb.active = 0;
     ldb.logs = listCreate();
-    listSetFreeMethod(ldb.logs,(void (*)(void*))sdsfree);
+    listSetFreeMethod(ldb.logs, sdsfreegeneric);
     ldb.children = listCreate();
     ldb.src = NULL;
     ldb.lines = 0;
@@ -669,7 +774,7 @@ void ldbFlushLog(list *log) {
         listDelNode(log,ln);
 }
 
-int ldbIsEnabled(){
+int ldbIsEnabled(void){
     return ldb.active && ldb.step;
 }
 
@@ -771,7 +876,7 @@ int ldbStartSession(client *c) {
             /* Log the creation of the child and close the listening
              * socket to make sure if the parent crashes a reset is sent
              * to the clients. */
-            serverLog(LL_WARNING,"Redis forked for debugging eval");
+            serverLog(LL_NOTICE,"Redis forked for debugging eval");
         } else {
             /* Parent */
             listAddNodeTail(ldb.children,(void*)(unsigned long)cp);
@@ -779,7 +884,7 @@ int ldbStartSession(client *c) {
             return 0;
         }
     } else {
-        serverLog(LL_WARNING,
+        serverLog(LL_NOTICE,
             "Redis synchronous debugging eval session started");
     }
 
@@ -813,10 +918,10 @@ void ldbEndSession(client *c) {
     /* If it's a fork()ed session, we just exit. */
     if (ldb.forked) {
         writeToClient(c,0);
-        serverLog(LL_WARNING,"Lua debugging session child exiting");
+        serverLog(LL_NOTICE,"Lua debugging session child exiting");
         exitFromChild(0);
     } else {
-        serverLog(LL_WARNING,
+        serverLog(LL_NOTICE,
             "Redis synchronous debugging eval session ended");
     }
 
@@ -860,7 +965,7 @@ void ldbKillForkedSessions(void) {
     listRewind(ldb.children,&li);
     while((ln = listNext(&li))) {
         pid_t pid = (unsigned long) ln->value;
-        serverLog(LL_WARNING,"Killing debugging session %ld",(long)pid);
+        serverLog(LL_NOTICE,"Killing debugging session %ld",(long)pid);
         kill(pid,SIGKILL);
     }
     listRelease(ldb.children);
@@ -1600,6 +1705,7 @@ ldbLog(sdsnew("                     next line of code."));
  * to start executing a new line. */
 void luaLdbLineHook(lua_State *lua, lua_Debug *ar) {
     scriptRunCtx* rctx = luaGetFromRegistry(lua, REGISTRY_RUN_CTX_NAME);
+    serverAssert(rctx); /* Only supported inside script invocation */
     lua_getstack(lua,0,ar);
     lua_getinfo(lua,"Sl",ar);
     ldb.currentline = ar->currentline;
@@ -1643,6 +1749,5 @@ void luaLdbLineHook(lua_State *lua, lua_Debug *ar) {
             luaError(lua);
         }
         rctx->start_time = getMonotonicUs();
-        rctx->snapshot_time = mstime();
     }
 }

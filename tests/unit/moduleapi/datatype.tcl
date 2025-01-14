@@ -1,11 +1,20 @@
 set testmodule [file normalize tests/modules/datatype.so]
 
 start_server {tags {"modules"}} {
+    test {DataType: test loadex with invalid config} {
+        catch { r module loadex $testmodule CONFIG invalid_config 1 } e
+        assert_match {*ERR Error loading the extension*} $e
+    }
+
     r module load $testmodule
 
     test {DataType: Test module is sane, GET/SET work.} {
         r datatype.set dtkey 100 stringval
         assert {[r datatype.get dtkey] eq {100 stringval}}
+    }
+
+    test {test blocking of datatype creation outside of OnLoad} {
+        assert_equal [r block.create.datatype.outside.onload] OK
     }
 
     test {DataType: RM_SaveDataTypeToString(), RM_LoadDataTypeFromStringEncver() work} {
@@ -84,5 +93,47 @@ start_server {tags {"modules"}} {
         }
         $rd read
         $rd close
+    }
+
+    test {DataType: check the type name} {
+        r flushdb
+        r datatype.set foo 111 bar
+        assert_type test___dt foo
+    }
+
+    test {SCAN module datatype} {
+        r flushdb
+        populate 1000
+        r datatype.set foo 111 bar
+        set type [r type foo]
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur type $type]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
+        }
+
+        assert_equal 1 [llength $keys]    
+    }
+
+    test {SCAN module datatype with case sensitive} {
+        r flushdb
+        populate 1000
+        r datatype.set foo 111 bar
+        set type "tEsT___dT"
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur type $type]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
+        }
+
+        assert_equal 1 [llength $keys]
     }
 }

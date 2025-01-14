@@ -1,30 +1,9 @@
 /*
- * Copyright (c) 2021, Redis Ltd.
+ * Copyright (c) 2011-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #include "functions.h"
@@ -32,6 +11,8 @@
 #include "dict.h"
 #include "adlist.h"
 #include "atomicvar.h"
+
+#define LOAD_TIMEOUT_MS 500
 
 typedef enum {
     restorePolicy_Flush, restorePolicy_Append, restorePolicy_Replace
@@ -43,6 +24,7 @@ static size_t engine_cache_memory = 0;
 static void engineFunctionDispose(dict *d, void *obj);
 static void engineStatsDispose(dict *d, void *obj);
 static void engineLibraryDispose(dict *d, void *obj);
+static void engineDispose(dict *d, void *obj);
 static int functionsVerifyName(sds name);
 
 typedef struct functionsLibEngineStats {
@@ -69,7 +51,7 @@ dictType engineDictType = {
         NULL,                  /* val dup */
         dictSdsKeyCaseCompare, /* key compare */
         dictSdsDestructor,     /* key destructor */
-        NULL,                  /* val destructor */
+        engineDispose,         /* val destructor */
         NULL                   /* allow to expand */
 };
 
@@ -116,10 +98,7 @@ dictType librariesDictType = {
 /* Dictionary of engines */
 static dict *engines = NULL;
 
-/* Libraries Ctx.
- * Contains the dictionary that map a library name to library object,
- * Contains the dictionary that map a function name to function object,
- * and the cache memory used by all the functions */
+/* Libraries Ctx. */
 static functionsLibCtx *curr_functions_lib_ctx = NULL;
 
 static size_t functionMallocSize(functionInfo *fi) {
@@ -165,9 +144,23 @@ static void engineLibraryFree(functionLibInfo* li) {
     zfree(li);
 }
 
+static void engineLibraryFreeGeneric(void *li) {
+    engineLibraryFree((functionLibInfo *)li);
+}
+
 static void engineLibraryDispose(dict *d, void *obj) {
     UNUSED(d);
     engineLibraryFree(obj);
+}
+
+static void engineDispose(dict *d, void *obj) {
+    UNUSED(d);
+    engineInfo *ei = obj;
+    freeClient(ei->c);
+    sdsfree(ei->name);
+    ei->engine->free_ctx(ei->engine->engine_ctx);
+    zfree(ei->engine);
+    zfree(ei);
 }
 
 /* Clear all the functions from the given library ctx */
@@ -182,17 +175,19 @@ void functionsLibCtxClear(functionsLibCtx *lib_ctx) {
         stats->n_lib = 0;
     }
     dictReleaseIterator(iter);
-    curr_functions_lib_ctx->cache_memory = 0;
+    lib_ctx->cache_memory = 0;
 }
 
 void functionsLibCtxClearCurrent(int async) {
     if (async) {
         functionsLibCtx *old_l_ctx = curr_functions_lib_ctx;
-        curr_functions_lib_ctx = functionsLibCtxCreate();
-        freeFunctionsAsync(old_l_ctx);
+        dict *old_engines = engines;
+        freeFunctionsAsync(old_l_ctx, old_engines);
     } else {
-        functionsLibCtxClear(curr_functions_lib_ctx);
+        functionsLibCtxFree(curr_functions_lib_ctx);
+        dictRelease(engines);
     }
+    functionsInit();
 }
 
 /* Free the given functions ctx */
@@ -212,12 +207,12 @@ void functionsLibCtxSwapWithCurrent(functionsLibCtx *new_lib_ctx) {
 }
 
 /* return the current functions ctx */
-functionsLibCtx* functionsLibCtxGetCurrent() {
+functionsLibCtx* functionsLibCtxGetCurrent(void) {
     return curr_functions_lib_ctx;
 }
 
 /* Create a new functions ctx */
-functionsLibCtx* functionsLibCtxCreate() {
+functionsLibCtx* functionsLibCtxCreate(void) {
     functionsLibCtx *ret = zmalloc(sizeof(functionsLibCtx));
     ret->libraries = dictCreate(&librariesDictType);
     ret->functions = dictCreate(&functionDictType);
@@ -245,7 +240,7 @@ functionsLibCtx* functionsLibCtxCreate() {
  */
 int functionLibCreateFunction(sds name, void *function, functionLibInfo *li, sds desc, uint64_t f_flags, sds *err) {
     if (functionsVerifyName(name) != C_OK) {
-        *err = sdsnew("Function names can only contain letters and numbers and must be at least one character long");
+        *err = sdsnew("Library names can only contain letters, numbers, or underscores(_) and must be at least one character long");
         return C_ERR;
     }
 
@@ -293,7 +288,7 @@ static void libraryUnlink(functionsLibCtx *lib_ctx, functionLibInfo* li) {
     entry = dictUnlink(lib_ctx->libraries, li->name);
     dictSetVal(lib_ctx->libraries, entry, NULL);
     dictFreeUnlinkedEntry(lib_ctx->libraries, entry);
-    lib_ctx->cache_memory += libraryMallocSize(li);
+    lib_ctx->cache_memory -= libraryMallocSize(li);
 
     /* update stats */
     functionsLibEngineStats *stats = dictFetchValue(lib_ctx->engines_stats, li->ei->name);
@@ -325,7 +320,7 @@ static void libraryLink(functionsLibCtx *lib_ctx, functionLibInfo* li) {
 /* Takes all libraries from lib_ctx_src and add to lib_ctx_dst.
  * On collision, if 'replace' argument is true, replace the existing library with the new one.
  * Otherwise abort and leave 'lib_ctx_dst' and 'lib_ctx_src' untouched.
- * Return C_OK on success and C_ERR if aborted. If C_ERR is retunred, set a relevant
+ * Return C_OK on success and C_ERR if aborted. If C_ERR is returned, set a relevant
  * error message on the 'err' out parameter.
  *  */
 static int libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *functions_lib_ctx_src, int replace, sds *err) {
@@ -347,7 +342,7 @@ static int libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *
             } else {
                 if (!old_libraries_list) {
                     old_libraries_list = listCreate();
-                    listSetFreeMethod(old_libraries_list, (void (*)(void*))engineLibraryFree);
+                    listSetFreeMethod(old_libraries_list, engineLibraryFreeGeneric);
                 }
                 libraryUnlink(functions_lib_ctx_dst, old_li);
                 listAddNodeTail(old_libraries_list, old_li);
@@ -497,7 +492,6 @@ static void functionListReplyFlags(client *c, functionInfo *fi) {
  * Return general information about all the libraries:
  * * Library name
  * * The engine used to run the Library
- * * Library description
  * * Functions list
  * * Library code (if WITHCODE is given)
  *
@@ -599,17 +593,36 @@ void functionDeleteCommand(client *c) {
     addReply(c, shared.ok);
 }
 
+/* FUNCTION KILL */
 void functionKillCommand(client *c) {
     scriptKill(c, 0);
 }
 
-static void fcallCommandGeneric(client *c, int ro) {
+/* Try to extract command flags if we can, returns the modified flags.
+ * Note that it does not guarantee the command arguments are right. */
+uint64_t fcallGetCommandFlags(client *c, uint64_t cmd_flags) {
     robj *function_name = c->argv[1];
-    functionInfo *fi = dictFetchValue(curr_functions_lib_ctx->functions, function_name->ptr);
-    if (!fi) {
+    c->cur_script = dictFind(curr_functions_lib_ctx->functions, function_name->ptr);
+    if (!c->cur_script)
+        return cmd_flags;
+    functionInfo *fi = dictGetVal(c->cur_script);
+    uint64_t script_flags = fi->f_flags;
+    return scriptFlagsToCmdFlags(cmd_flags, script_flags);
+}
+
+static void fcallCommandGeneric(client *c, int ro) {
+    /* Functions need to be fed to monitors before the commands they execute. */
+    replicationFeedMonitors(c,server.monitors,c->db->id,c->argv,c->argc);
+
+    robj *function_name = c->argv[1];
+    dictEntry *de = c->cur_script;
+    if (!de)
+        de = dictFind(curr_functions_lib_ctx->functions, function_name->ptr);
+    if (!de) {
         addReplyError(c, "Function not found");
         return;
     }
+    functionInfo *fi = dictGetVal(de);
     engine *engine = fi->li->ei->engine;
 
     long long numkeys;
@@ -660,9 +673,8 @@ void fcallroCommand(client *c) {
  * is saved separately with the following information:
  * * Library name
  * * Engine name
- * * Library description
  * * Library code
- * RDB_OPCODE_FUNCTION is saved before each library to present
+ * RDB_OPCODE_FUNCTION2 is saved before each library to present
  * that the payload is a library.
  * RDB version and crc64 is saved at the end of the payload.
  * The RDB version is saved for backward compatibility.
@@ -742,11 +754,15 @@ void functionRestoreCommand(client *c) {
             err = sdsnew("can not read data type");
             goto load_error;
         }
-        if (type != RDB_OPCODE_FUNCTION && type != RDB_OPCODE_FUNCTION2) {
+        if (type == RDB_OPCODE_FUNCTION_PRE_GA) {
+            err = sdsnew("Pre-GA function format not supported");
+            goto load_error;
+        }
+        if (type != RDB_OPCODE_FUNCTION2) {
             err = sdsnew("given type is not a function");
             goto load_error;
         }
-        if (rdbFunctionLoad(&payload, rdbver, functions_lib_ctx, type, RDBFLAGS_NONE, &err) != C_OK) {
+        if (rdbFunctionLoad(&payload, rdbver, functions_lib_ctx, RDBFLAGS_NONE, &err) != C_OK) {
             if (!err) {
                 err = sdsnew("failed loading the given functions payload");
             }
@@ -778,6 +794,7 @@ load_error:
     }
 }
 
+/* FUNCTION FLUSH [ASYNC | SYNC] */
 void functionFlushCommand(client *c) {
     if (c->argc > 3) {
         addReplySubcommandSyntaxError(c);
@@ -803,9 +820,10 @@ void functionFlushCommand(client *c) {
     addReply(c,shared.ok);
 }
 
+/* FUNCTION HELP */
 void functionHelpCommand(client *c) {
     const char *help[] = {
-"LOAD <ENGINE NAME> <LIBRARY NAME> [REPLACE] [DESCRIPTION <LIBRARY DESCRIPTION>] <LIBRARY CODE>",
+"LOAD [REPLACE] <FUNCTION CODE>",
 "    Create a new library with the given library name and code.",
 "DELETE <LIBRARY NAME>",
 "    Delete the given library.",
@@ -813,7 +831,6 @@ void functionHelpCommand(client *c) {
 "    Return general information on all the libraries:",
 "    * Library name",
 "    * The engine used to run the Library",
-"    * Library description",
 "    * Functions list",
 "    * Library code (if WITHCODE is given)",
 "    It also possible to get only function that matches a pattern using LIBRARYNAME argument.",
@@ -833,7 +850,7 @@ void functionHelpCommand(client *c) {
 "    * ASYNC: Asynchronously flush the libraries.",
 "    * SYNC: Synchronously flush the libraries.",
 "DUMP",
-"    Returns a serialized payload representing the current libraries, can be restored using FUNCTION RESTORE command",
+"    Return a serialized payload representing the current libraries, can be restored using FUNCTION RESTORE command",
 "RESTORE <PAYLOAD> [FLUSH|APPEND|REPLACE]",
 "    Restore the libraries represented by the given payload, it is possible to give a restore policy to",
 "    control how to handle existing libraries (default APPEND):",
@@ -867,9 +884,7 @@ static int functionsVerifyName(sds name) {
 
 int functionExtractLibMetaData(sds payload, functionsLibMataData *md, sds *err) {
     sds name = NULL;
-    sds desc = NULL;
     sds engine = NULL;
-    sds code = NULL;
     if (strncmp(payload, "#!", 2) != 0) {
         *err = sdsnew("Missing library metadata");
         return C_ERR;
@@ -921,9 +936,7 @@ int functionExtractLibMetaData(sds payload, functionsLibMataData *md, sds *err) 
 
 error:
     if (name) sdsfree(name);
-    if (desc) sdsfree(desc);
     if (engine) sdsfree(engine);
-    if (code) sdsfree(code);
     sdsfreesplitres(parts, numparts);
     return C_ERR;
 }
@@ -936,7 +949,7 @@ void functionFreeLibMetaData(functionsLibMataData *md) {
 
 /* Compile and save the given library, return the loaded library name on success
  * and NULL on failure. In case on failure the err out param is set with relevant error message */
-sds functionsCreateWithLibraryCtx(sds code, int replace, sds* err, functionsLibCtx *lib_ctx) {
+sds functionsCreateWithLibraryCtx(sds code, int replace, sds* err, functionsLibCtx *lib_ctx, size_t timeout) {
     dictIterator *iter = NULL;
     dictEntry *entry = NULL;
     functionLibInfo *new_li = NULL;
@@ -947,7 +960,7 @@ sds functionsCreateWithLibraryCtx(sds code, int replace, sds* err, functionsLibC
     }
 
     if (functionsVerifyName(md.name)) {
-        *err = sdsnew("Library names can only contain letters and numbers and must be at least one character long");
+        *err = sdsnew("Library names can only contain letters, numbers, or underscores(_) and must be at least one character long");
         goto error;
     }
 
@@ -960,6 +973,7 @@ sds functionsCreateWithLibraryCtx(sds code, int replace, sds* err, functionsLibC
 
     old_li = dictFetchValue(lib_ctx->libraries, md.name);
     if (old_li && !replace) {
+        old_li = NULL;
         *err = sdscatfmt(sdsempty(), "Library '%S' already exists", md.name);
         goto error;
     }
@@ -969,7 +983,7 @@ sds functionsCreateWithLibraryCtx(sds code, int replace, sds* err, functionsLibC
     }
 
     new_li = engineLibraryCreate(md.name, ei, code);
-    if (engine->create(engine->engine_ctx, new_li, md.code, err) != C_OK) {
+    if (engine->create(engine->engine_ctx, new_li, md.code, timeout, err) != C_OK) {
         goto error;
     }
 
@@ -1037,7 +1051,11 @@ void functionLoadCommand(client *c) {
     robj *code = c->argv[argc_pos];
     sds err = NULL;
     sds library_name = NULL;
-    if (!(library_name = functionsCreateWithLibraryCtx(code->ptr, replace, &err, curr_functions_lib_ctx)))
+    size_t timeout = LOAD_TIMEOUT_MS;
+    if (mustObeyClient(c)) {
+        timeout = 0;
+    }
+    if (!(library_name = functionsCreateWithLibraryCtx(code->ptr, replace, &err, curr_functions_lib_ctx, timeout)))
     {
         addReplyErrorSds(c, err);
         return;
@@ -1049,26 +1067,25 @@ void functionLoadCommand(client *c) {
 }
 
 /* Return memory usage of all the engines combine */
-unsigned long functionsMemory() {
+unsigned long functionsMemoryVM(void) {
     dictIterator *iter = dictGetIterator(engines);
     dictEntry *entry = NULL;
-    size_t engines_nemory = 0;
+    size_t engines_memory = 0;
     while ((entry = dictNext(iter))) {
         engineInfo *ei = dictGetVal(entry);
         engine *engine = ei->engine;
-        engines_nemory += engine->get_used_memory(engine->engine_ctx);
+        engines_memory += engine->get_used_memory(engine->engine_ctx);
     }
     dictReleaseIterator(iter);
 
-    return engines_nemory;
+    return engines_memory;
 }
 
 /* Return memory overhead of all the engines combine */
-unsigned long functionsMemoryOverhead() {
-    size_t memory_overhead = dictSize(engines) * sizeof(dictEntry) +
-            dictSlots(engines) * sizeof(dictEntry*);
-    memory_overhead += dictSize(curr_functions_lib_ctx->functions) * sizeof(dictEntry) +
-            dictSlots(curr_functions_lib_ctx->functions) * sizeof(dictEntry*) + sizeof(functionsLibCtx);
+unsigned long functionsMemoryEngine(void) {
+    size_t memory_overhead = dictMemUsage(engines);
+    memory_overhead += dictMemUsage(curr_functions_lib_ctx->functions);
+    memory_overhead += sizeof(functionsLibCtx);
     memory_overhead += curr_functions_lib_ctx->cache_memory;
     memory_overhead += engine_cache_memory;
 
@@ -1076,25 +1093,25 @@ unsigned long functionsMemoryOverhead() {
 }
 
 /* Returns the number of functions */
-unsigned long functionsNum() {
+unsigned long functionsNum(void) {
     return dictSize(curr_functions_lib_ctx->functions);
 }
 
-unsigned long functionsLibNum() {
+unsigned long functionsLibNum(void) {
     return dictSize(curr_functions_lib_ctx->libraries);
 }
 
-dict* functionsLibGet() {
+dict* functionsLibGet(void) {
     return curr_functions_lib_ctx->libraries;
 }
 
-size_t functionsLibCtxfunctionsLen(functionsLibCtx *functions_ctx) {
+size_t functionsLibCtxFunctionsLen(functionsLibCtx *functions_ctx) {
     return dictSize(functions_ctx->functions);
 }
 
 /* Initialize engine data structures.
  * Should be called once on server initialization */
-int functionsInit() {
+int functionsInit(void) {
     engines = dictCreate(&engineDictType);
 
     if (luaEngineInitEngine() != C_OK) {
