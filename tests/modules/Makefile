@@ -4,10 +4,10 @@ uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 
 warning_cflags = -W -Wall -Wno-missing-field-initializers
 ifeq ($(uname_S),Darwin)
-	SHOBJ_CFLAGS ?= $(warning_cflags) -dynamic -fno-common -g -ggdb -std=c99 -O2
+	SHOBJ_CFLAGS ?= $(warning_cflags) -dynamic -fno-common -g -ggdb -std=gnu11 -O2
 	SHOBJ_LDFLAGS ?= -bundle -undefined dynamic_lookup
 else	# Linux, others
-	SHOBJ_CFLAGS ?= $(warning_cflags) -fno-common -g -ggdb -std=c99 -O2
+	SHOBJ_CFLAGS ?= $(warning_cflags) -fno-common -g -ggdb -std=gnu11 -O2
 	SHOBJ_LDFLAGS ?= -shared
 endif
 
@@ -49,6 +49,7 @@ TEST_MODULES = \
     hash.so \
     zset.so \
     stream.so \
+    mallocsize.so \
     aclcheck.so \
     list.so \
     subcommands.so \
@@ -56,7 +57,14 @@ TEST_MODULES = \
     cmdintrospection.so \
     eventloop.so \
     moduleconfigs.so \
-    moduleconfigstwo.so
+    moduleconfigstwo.so \
+    publish.so \
+    usercall.so \
+    postnotifications.so \
+    moduleauthtwo.so \
+    rdbloadsave.so \
+    crash.so \
+    internalsecret.so
 
 .PHONY: all
 

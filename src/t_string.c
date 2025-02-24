@@ -1,30 +1,9 @@
 /*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #include "server.h"
@@ -37,8 +16,14 @@ int getGenericCommand(client *c);
  * String Commands
  *----------------------------------------------------------------------------*/
 
-static int checkStringLength(client *c, long long size) {
-    if (!(c->flags & CLIENT_MASTER) && size > server.proto_max_bulk_len) {
+static int checkStringLength(client *c, long long size, long long append) {
+    if (mustObeyClient(c))
+        return C_OK;
+    /* 'uint64_t' cast is there just to prevent undefined behavior on overflow */
+    long long total = (uint64_t)size + append;
+    /* Test configured max-bulk-len representing a limit of the biggest string object,
+     * and also test for overflow. */
+    if (total > server.proto_max_bulk_len || total < size || total < append) {
         addReplyError(c,"string exceeds maximum allowed size (proto-max-bulk-len)");
         return C_ERR;
     }
@@ -76,7 +61,7 @@ static int checkStringLength(client *c, long long size) {
 static int getExpireMillisecondsOrReply(client *c, robj *expire, int flags, int unit, long long *milliseconds);
 
 void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire, int unit, robj *ok_reply, robj *abort_reply) {
-    long long milliseconds = 0; /* initialized to avoid any harmness warning */
+    long long milliseconds = 0; /* initialized to avoid any harmless warning */
     int found = 0;
     int setkey_flags = 0;
 
@@ -88,7 +73,8 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
         if (getGenericCommand(c) == C_ERR) return;
     }
 
-    found = (lookupKeyWrite(c->db,key) != NULL);
+    dictEntry *de = NULL;
+    found = (lookupKeyWriteWithDictEntry(c->db,key,&de) != NULL);
 
     if ((flags & OBJ_SET_NX && found) ||
         (flags & OBJ_SET_XX && !found))
@@ -99,20 +85,23 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
         return;
     }
 
-    setkey_flags |= (flags & OBJ_KEEPTTL) ? SETKEY_KEEPTTL : 0;
+    /* When expire is not NULL, we avoid deleting the TTL so it can be updated later instead of being deleted and then created again. */
+    setkey_flags |= ((flags & OBJ_KEEPTTL) || expire) ? SETKEY_KEEPTTL : 0;
     setkey_flags |= found ? SETKEY_ALREADY_EXIST : SETKEY_DOESNT_EXIST;
 
-    setKey(c,c->db,key,val,setkey_flags);
+    setKeyWithDictEntry(c,c->db,key,val,setkey_flags,de);
     server.dirty++;
     notifyKeyspaceEvent(NOTIFY_STRING,"set",key,c->db->id);
 
     if (expire) {
-        setExpire(c,c->db,key,milliseconds);
+        setExpireWithDictEntry(c,c->db,key,milliseconds,de);
         /* Propagate as SET Key Value PXAT millisecond-timestamp if there is
-         * EX/PX/EXAT/PXAT flag. */
-        robj *milliseconds_obj = createStringObjectFromLongLong(milliseconds);
-        rewriteClientCommandVector(c, 5, shared.set, key, val, shared.pxat, milliseconds_obj);
-        decrRefCount(milliseconds_obj);
+         * EX/PX/EXAT flag. */
+        if (!(flags & OBJ_PXAT)) {
+            robj *milliseconds_obj = createStringObjectFromLongLong(milliseconds);
+            rewriteClientCommandVector(c, 5, shared.set, key, val, shared.pxat, milliseconds_obj);
+            decrRefCount(milliseconds_obj);
+        }
         notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
     }
 
@@ -167,7 +156,7 @@ static int getExpireMillisecondsOrReply(client *c, robj *expire, int flags, int 
     if (unit == UNIT_SECONDS) *milliseconds *= 1000;
 
     if ((flags & OBJ_PX) || (flags & OBJ_EX)) {
-        *milliseconds += mstime();
+        *milliseconds += commandTimeSnapshot();
     }
 
     if (*milliseconds <= 0) {
@@ -381,8 +370,7 @@ void getexCommand(client *c) {
     if (((flags & OBJ_PXAT) || (flags & OBJ_EXAT)) && checkAlreadyExpired(milliseconds)) {
         /* When PXAT/EXAT absolute timestamp is specified, there can be a chance that timestamp
          * has already elapsed so delete the key in that case. */
-        int deleted = server.lazyfree_lazy_expire ? dbAsyncDelete(c->db, c->argv[1]) :
-                      dbSyncDelete(c->db, c->argv[1]);
+        int deleted = dbGenericDelete(c->db, c->argv[1], server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED);
         serverAssert(deleted);
         robj *aux = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
         rewriteClientCommandVector(c,2,aux,c->argv[1]);
@@ -411,12 +399,9 @@ void getexCommand(client *c) {
 
 void getdelCommand(client *c) {
     if (getGenericCommand(c) == C_ERR) return;
-    int deleted = server.lazyfree_lazy_user_del ? dbAsyncDelete(c->db, c->argv[1]) :
-                  dbSyncDelete(c->db, c->argv[1]);
-    if (deleted) {
-        /* Propagate as DEL/UNLINK command */
-        robj *aux = server.lazyfree_lazy_user_del ? shared.unlink : shared.del;
-        rewriteClientCommandVector(c,2,aux,c->argv[1]);
+    if (dbSyncDelete(c->db, c->argv[1])) {
+        /* Propagate as DEL command */
+        rewriteClientCommandVector(c,2,shared.del,c->argv[1]);
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
         server.dirty++;
@@ -435,9 +420,11 @@ void getsetCommand(client *c) {
 }
 
 void setrangeCommand(client *c) {
+    size_t oldLen = 0, newLen;
     robj *o;
     long offset;
     sds value = c->argv[3]->ptr;
+    const size_t value_len = sdslen(value);
 
     if (getLongFromObjectOrReply(c,c->argv[2],&offset,NULL) != C_OK)
         return;
@@ -447,51 +434,53 @@ void setrangeCommand(client *c) {
         return;
     }
 
-    o = lookupKeyWrite(c->db,c->argv[1]);
+    dictEntry *de;
+    o = lookupKeyWriteWithDictEntry(c->db,c->argv[1],&de);
     if (o == NULL) {
         /* Return 0 when setting nothing on a non-existing string */
-        if (sdslen(value) == 0) {
+        if (value_len == 0) {
             addReply(c,shared.czero);
             return;
         }
 
         /* Return when the resulting string exceeds allowed size */
-        if (checkStringLength(c,offset+sdslen(value)) != C_OK)
+        if (checkStringLength(c,offset,value_len) != C_OK)
             return;
 
-        o = createObject(OBJ_STRING,sdsnewlen(NULL, offset+sdslen(value)));
+        o = createObject(OBJ_STRING,sdsnewlen(NULL, offset+value_len));
         dbAdd(c->db,c->argv[1],o);
     } else {
-        size_t olen;
-
         /* Key exists, check type */
         if (checkType(c,o,OBJ_STRING))
             return;
 
         /* Return existing string length when setting nothing */
-        olen = stringObjectLen(o);
-        if (sdslen(value) == 0) {
-            addReplyLongLong(c,olen);
+        oldLen = stringObjectLen(o);
+        if (value_len == 0) {
+            addReplyLongLong(c, oldLen);
             return;
         }
 
         /* Return when the resulting string exceeds allowed size */
-        if (checkStringLength(c,offset+sdslen(value)) != C_OK)
+        if (checkStringLength(c,offset,value_len) != C_OK)
             return;
 
         /* Create a copy when the object is shared or encoded. */
-        o = dbUnshareStringValue(c->db,c->argv[1],o);
+        o = dbUnshareStringValueWithDictEntry(c->db,c->argv[1],o,de);
     }
 
-    if (sdslen(value) > 0) {
-        o->ptr = sdsgrowzero(o->ptr,offset+sdslen(value));
-        memcpy((char*)o->ptr+offset,value,sdslen(value));
+    if (value_len > 0) {
+        o->ptr = sdsgrowzero(o->ptr,offset+value_len);
+        memcpy((char*)o->ptr+offset,value,value_len);
         signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_STRING,
             "setrange",c->argv[1],c->db->id);
         server.dirty++;
     }
-    addReplyLongLong(c,sdslen(o->ptr));
+
+    newLen = sdslen(o->ptr);
+    updateKeysizesHist(c->db,getKeySlot(c->argv[1]->ptr),OBJ_STRING,oldLen,newLen);
+    addReplyLongLong(c,newLen);
 }
 
 void getrangeCommand(client *c) {
@@ -572,10 +561,14 @@ void msetGenericCommand(client *c, int nx) {
         }
     }
 
+    int setkey_flags = nx ? SETKEY_DOESNT_EXIST : 0;
     for (j = 1; j < c->argc; j += 2) {
         c->argv[j+1] = tryObjectEncoding(c->argv[j+1]);
-        setKey(c,c->db,c->argv[j],c->argv[j+1],0);
+        setKey(c, c->db, c->argv[j], c->argv[j + 1], setkey_flags);
         notifyKeyspaceEvent(NOTIFY_STRING,"set",c->argv[j],c->db->id);
+        /* In MSETNX, It could be that we're overriding the same key, we can't be sure it doesn't exist. */
+        if (nx)
+            setkey_flags = SETKEY_ADD_OR_UPDATE;
     }
     server.dirty += (c->argc-1)/2;
     addReply(c, nx ? shared.cone : shared.ok);
@@ -592,8 +585,8 @@ void msetnxCommand(client *c) {
 void incrDecrCommand(client *c, long long incr) {
     long long value, oldvalue;
     robj *o, *new;
-
-    o = lookupKeyWrite(c->db,c->argv[1]);
+    dictEntry *de;
+    o = lookupKeyWriteWithDictEntry(c->db,c->argv[1],&de);
     if (checkType(c,o,OBJ_STRING)) return;
     if (getLongLongFromObjectOrReply(c,o,&value,NULL) != C_OK) return;
 
@@ -614,7 +607,7 @@ void incrDecrCommand(client *c, long long incr) {
     } else {
         new = createStringObjectFromLongLongForValue(value);
         if (o) {
-            dbOverwrite(c->db,c->argv[1],new);
+            dbReplaceValueWithDictEntry(c->db,c->argv[1],new,de);
         } else {
             dbAdd(c->db,c->argv[1],new);
         }
@@ -622,7 +615,7 @@ void incrDecrCommand(client *c, long long incr) {
     signalModifiedKey(c,c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_STRING,"incrby",c->argv[1],c->db->id);
     server.dirty++;
-    addReplyLongLong(c, value);
+    addReplyLongLongFromStr(c,new);
 }
 
 void incrCommand(client *c) {
@@ -656,7 +649,8 @@ void incrbyfloatCommand(client *c) {
     long double incr, value;
     robj *o, *new;
 
-    o = lookupKeyWrite(c->db,c->argv[1]);
+    dictEntry *de;
+    o = lookupKeyWriteWithDictEntry(c->db,c->argv[1],&de);
     if (checkType(c,o,OBJ_STRING)) return;
     if (getLongDoubleFromObjectOrReply(c,o,&value,NULL) != C_OK ||
         getLongDoubleFromObjectOrReply(c,c->argv[2],&incr,NULL) != C_OK)
@@ -669,7 +663,7 @@ void incrbyfloatCommand(client *c) {
     }
     new = createStringObjectFromLongDouble(value,1);
     if (o)
-        dbOverwrite(c->db,c->argv[1],new);
+        dbReplaceValueWithDictEntry(c->db,c->argv[1],new,de);
     else
         dbAdd(c->db,c->argv[1],new);
     signalModifiedKey(c,c->db,c->argv[1]);
@@ -686,16 +680,17 @@ void incrbyfloatCommand(client *c) {
 }
 
 void appendCommand(client *c) {
-    size_t totlen;
+    size_t totlen, append_len;
     robj *o, *append;
 
-    o = lookupKeyWrite(c->db,c->argv[1]);
+    dictEntry *de;
+    o = lookupKeyWriteWithDictEntry(c->db,c->argv[1],&de);
     if (o == NULL) {
         /* Create the key */
         c->argv[2] = tryObjectEncoding(c->argv[2]);
         dbAdd(c->db,c->argv[1],c->argv[2]);
         incrRefCount(c->argv[2]);
-        totlen = stringObjectLen(c->argv[2]);
+        append_len = totlen = stringObjectLen(c->argv[2]);
     } else {
         /* Key exists, check type */
         if (checkType(c,o,OBJ_STRING))
@@ -703,18 +698,19 @@ void appendCommand(client *c) {
 
         /* "append" is an argument, so always an sds */
         append = c->argv[2];
-        totlen = stringObjectLen(o)+sdslen(append->ptr);
-        if (checkStringLength(c,totlen) != C_OK)
+        append_len = sdslen(append->ptr);
+        if (checkStringLength(c,stringObjectLen(o),append_len) != C_OK)
             return;
 
         /* Append the value */
-        o = dbUnshareStringValue(c->db,c->argv[1],o);
-        o->ptr = sdscatlen(o->ptr,append->ptr,sdslen(append->ptr));
+        o = dbUnshareStringValueWithDictEntry(c->db,c->argv[1],o,de);
+        o->ptr = sdscatlen(o->ptr,append->ptr,append_len);
         totlen = sdslen(o->ptr);
     }
     signalModifiedKey(c,c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_STRING,"append",c->argv[1],c->db->id);
     server.dirty++;
+    updateKeysizesHist(c->db,getKeySlot(c->argv[1]->ptr),OBJ_STRING, totlen - append_len, totlen);
     addReplyLongLong(c,totlen);
 }
 
@@ -792,7 +788,7 @@ void lcsCommand(client *c) {
 
     /* Setup an uint32_t array to store at LCS[i,j] the length of the
      * LCS A0..i-1, B0..j-1. Note that we have a linear array here, so
-     * we index it as LCS[j+(blen+1)*j] */
+     * we index it as LCS[j+(blen+1)*i] */
     #define LCS(A,B) lcs[(B)+((A)*(blen+1))]
 
     /* Try to allocate the LCS table, and abort on overflow or insufficient memory. */
