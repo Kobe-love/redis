@@ -1,15 +1,18 @@
 # Cluster-specific test functions.
 #
-# Copyright (C) 2014 Salvatore Sanfilippo antirez@gmail.com
-# This software is released under the BSD License. See the COPYING file for
-# more information.
+# Copyright (C) 2014-Present, Redis Ltd.
+# All Rights reserved.
+#
+# Licensed under your choice of the Redis Source Available License 2.0
+# (RSALv2) or the Server Side Public License v1 (SSPLv1).
 
 # Track cluster configuration as created by create_cluster below
 set ::cluster_master_nodes 0
 set ::cluster_replica_nodes 0
 
-# Returns a parsed CLUSTER NODES output as a list of dictionaries.
-proc get_cluster_nodes id {
+# Returns a parsed CLUSTER NODES output as a list of dictionaries. Optional status field
+# can be specified to only returns entries that match the provided status.
+proc get_cluster_nodes {id {status "*"}} {
     set lines [split [R $id cluster nodes] "\r\n"]
     set nodes {}
     foreach l $lines {
@@ -27,7 +30,9 @@ proc get_cluster_nodes id {
             linkstate [lindex $args 7] \
             slots [lrange $args 8 end] \
         ]
-        lappend nodes $node
+        if {[string match $status [lindex $args 7]]} {
+            lappend nodes $node
+        }
     }
     return $nodes
 }
@@ -90,6 +95,31 @@ proc assert_cluster_state {state} {
         } else {
             fail "Cluster node $id cluster_state:[CI $id cluster_state]"
         }
+    }
+
+    wait_for_secrets_match 50 100
+}
+
+proc num_unique_secrets {} {
+    set secrets [list]
+    foreach_redis_id id {
+        if {[instance_is_killed redis $id]} continue
+        lappend secrets [R $id debug internal_secret]
+    }
+    set num_secrets [llength [lsort -unique $secrets]]
+    return $num_secrets
+}
+
+# Check that cluster nodes agree about "state", or raise an error.
+proc assert_secrets_match {} {
+    assert_equal {1} [num_unique_secrets]
+}
+
+proc wait_for_secrets_match {maxtries delay} {
+    wait_for_condition $maxtries $delay {
+        [num_unique_secrets] eq 1
+    } else {
+        fail "Failed waiting for secrets to sync"
     }
 }
 
@@ -183,9 +213,11 @@ proc cluster_config_consistent {} {
     for {set j 0} {$j < $::cluster_master_nodes + $::cluster_replica_nodes} {incr j} {
         if {$j == 0} {
             set base_cfg [R $j cluster slots]
+            set base_secret [R $j debug internal_secret]
         } else {
             set cfg [R $j cluster slots]
-            if {$cfg != $base_cfg} {
+            set secret [R $j debug internal_secret]
+            if {$cfg != $base_cfg || $secret != $base_secret} {
                 return 0
             }
         }
@@ -216,73 +248,4 @@ proc are_hostnames_propagated {match_string} {
         }
     }
     return 1
-}
-
-# Returns a parsed CLUSTER LINKS output of the instance identified
-# by the given `id` as a list of dictionaries, with each dictionary
-# corresponds to a link.
-proc get_cluster_links id {
-    set lines [R $id cluster links]
-    set links {}
-    foreach l $lines {
-        if {$l eq {}} continue
-        assert_equal [llength $l] 12
-        assert_equal [lindex $l 0] "direction"
-        set dir [lindex $l 1]
-        assert_equal [lindex $l 2] "node"
-        set node [lindex $l 3]
-        assert_equal [lindex $l 4] "create-time"
-        set create_time [lindex $l 5]
-        assert_equal [lindex $l 6] "events"
-        set events [lindex $l 7]
-        assert_equal [lindex $l 8] "send-buffer-allocated"
-        set send_buffer_allocated [lindex $l 9]
-        assert_equal [lindex $l 10] "send-buffer-used"
-        set send_buffer_used [lindex $l 11]
-        set link [dict create \
-            dir $dir \
-            node $node \
-            create_time $create_time \
-            events $events \
-            send_buffer_allocated $send_buffer_allocated \
-            send_buffer_used $send_buffer_used \
-        ]
-        lappend links $link
-    }
-    return $links
-}
-
-proc get_links_with_peer {this_instance_id peer_nodename} {
-    set links [get_cluster_links $this_instance_id]
-    set links_with_peer {}
-    foreach l $links {
-        if {[dict get $l node] eq $peer_nodename} {
-            lappend links_with_peer $l
-        }
-    }
-    return $links_with_peer
-}
-
-# Return the entry in CLUSTER LINKS output by instance identified by `this_instance_id` that
-# corresponds to the link established toward a peer identified by `peer_nodename`
-proc get_link_to_peer {this_instance_id peer_nodename} {
-    set links_with_peer [get_links_with_peer $this_instance_id $peer_nodename]
-    foreach l $links_with_peer {
-        if {[dict get $l dir] eq "to"} {
-            return $l
-        }
-    }
-    return {}
-}
-
-# Return the entry in CLUSTER LINKS output by instance identified by `this_instance_id` that
-# corresponds to the link accepted from a peer identified by `peer_nodename`
-proc get_link_from_peer {this_instance_id peer_nodename} {
-    set links_with_peer [get_links_with_peer $this_instance_id $peer_nodename]
-    foreach l $links_with_peer {
-        if {[dict get $l dir] eq "from"} {
-            return $l
-        }
-    }
-    return {}
 }

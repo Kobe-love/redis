@@ -6,6 +6,30 @@ start_server {tags {"other"}} {
         } {ok}
     }
 
+    test {Coverage: HELP commands} {
+        assert_match "*OBJECT <subcommand> *" [r OBJECT HELP]
+        assert_match "*MEMORY <subcommand> *" [r MEMORY HELP]
+        assert_match "*PUBSUB <subcommand> *" [r PUBSUB HELP]
+        assert_match "*SLOWLOG <subcommand> *" [r SLOWLOG HELP]
+        assert_match "*CLIENT <subcommand> *" [r CLIENT HELP]
+        assert_match "*COMMAND <subcommand> *" [r COMMAND HELP]
+        assert_match "*CONFIG <subcommand> *" [r CONFIG HELP]
+        assert_match "*FUNCTION <subcommand> *" [r FUNCTION HELP]
+        assert_match "*MODULE <subcommand> *" [r MODULE HELP]
+    }
+
+    test {Coverage: MEMORY MALLOC-STATS} {
+        if {[string match {*jemalloc*} [s mem_allocator]]} {
+            assert_match "*jemalloc*" [r memory malloc-stats]
+        }
+    }
+
+    test {Coverage: MEMORY PURGE} {
+        if {[string match {*jemalloc*} [s mem_allocator]]} {
+            assert_equal {OK} [r memory purge]
+        }
+    }
+
     test {SAVE - make sure there are all the types as values} {
         # Wait for a background saving in progress to terminate
         waitForBgsave r
@@ -38,9 +62,39 @@ start_server {tags {"other"}} {
         }
     }
 
+    start_server {overrides {save ""} tags {external:skip}} {
+        test {FLUSHALL should not reset the dirty counter if we disable save} {
+            r set key value
+            r flushall
+            assert_morethan [s rdb_changes_since_last_save] 0
+        }
+
+        test {FLUSHALL should reset the dirty counter to 0 if we enable save} {
+            r config set save "3600 1 300 100 60 10000"
+            r set key value
+            r flushall
+            assert_equal [s rdb_changes_since_last_save] 0
+        }
+
+        test {FLUSHALL and bgsave} {
+            r config set save "3600 1 300 100 60 10000"
+            r set x y
+            r bgsave
+            r set x y
+            r multi
+            r debug sleep 1
+            # by the time we'll get to run flushall, the child will finish,
+            # but the parent will be unaware of it, and it could wrongly set the dirty counter.
+            r flushall
+            r exec
+            assert_equal [s rdb_changes_since_last_save] 0
+        }
+    }
+
     test {BGSAVE} {
-        r flushdb
-        waitForBgsave r
+        # Use FLUSHALL instead of FLUSHDB, FLUSHALL do a foreground save
+        # and reset the dirty counter to 0, so we won't trigger an unexpected bgsave.
+        r flushall
         r save
         r set x 10
         r bgsave
@@ -84,7 +138,8 @@ start_server {tags {"other"}} {
         if {$::accurate} {set numops 10000} else {set numops 1000}
         test {Check consistency of different data types after a reload} {
             r flushdb
-            createComplexDataset r $numops usetag
+            # TODO: integrate usehexpire following next commit that will support replication
+            createComplexDataset r $numops {usetag usehexpire}
             if {$::ignoredigest} {
                 set _ 1
             } else {
@@ -311,7 +366,7 @@ start_server {tags {"other"}} {
         assert_error {*unknown command*} {r GET|SET}
         assert_error {*unknown command*} {r GET|SET|OTHER}
         assert_error {*unknown command*} {r CONFIG|GET GET_XX}
-        assert_error {*Unknown subcommand*} {r CONFIG GET_XX}
+        assert_error {*unknown subcommand*} {r CONFIG GET_XX}
     }
 }
 
@@ -320,7 +375,7 @@ start_server {tags {"other external:skip"}} {
         r config set save ""
         r config set rdb-key-save-delay 1000000
 
-        populate 4096 "" 1
+        populate 4095 "" 1
         r bgsave
         wait_for_condition 10 100 {
             [s rdb_bgsave_in_progress] eq 1
@@ -333,12 +388,14 @@ start_server {tags {"other external:skip"}} {
         assert_no_match "*table size: 8192*" [r debug HTSTATS 9]
         exec kill -9 [get_child_pid 0]
         waitForBgsave r
-        after 200 ;# waiting for serverCron
 
         # Hash table should rehash since there is no child process,
-        # size is power of two and over 4098, so it is 8192
-        r set k3 v3
-        assert_match "*table size: 8192*" [r debug HTSTATS 9]
+        # size is power of two and over 4096, so it is 8192
+        wait_for_condition 50 100 {
+            [string match "*table size: 8192*" [r debug HTSTATS 9]]
+        } else {
+            fail "hash table did not rehash after child process killed"
+        }
     } {} {needs:debug needs:local-process}
 }
 
@@ -364,13 +421,14 @@ start_server {tags {"other external:skip"}} {
             assert_match "*/redis-server" [lindex $cmdline 1]
             
             if {$::tls} {
-                set expect_port 0
+                set expect_port [srv 0 pport]
                 set expect_tls_port [srv 0 port]
+                set port [srv 0 pport]
             } else {
                 set expect_port [srv 0 port]
                 set expect_tls_port 0
+                set port [srv 0 port]
             }
-            set port [srv 0 port]
 
             assert_equal "$::host:$port" [lindex $cmdline 2]
             assert_equal $expect_port [lindex $cmdline 3]
@@ -385,3 +443,90 @@ start_server {tags {"other external:skip"}} {
     }
 }
 
+start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
+    r config set dynamic-hz no hz 500
+    test "Redis can trigger resizing" {
+        r flushall
+        # hashslot(foo) is 12182
+        for {set j 1} {$j <= 128} {incr j} {
+            r set "{foo}$j" a
+        }
+        assert_match "*table size: 128*" [r debug HTSTATS 0]
+
+        # disable resizing, the reason for not using slow bgsave is because
+        # it will hit the dict_force_resize_ratio.
+        r debug dict-resizing 0
+
+        # delete data to have lot's (96%) of empty buckets
+        for {set j 1} {$j <= 123} {incr j} {
+            r del "{foo}$j"
+        }
+        assert_match "*table size: 128*" [r debug HTSTATS 0]
+
+        # enable resizing
+        r debug dict-resizing 1
+
+        # waiting for serverCron to resize the tables
+        wait_for_condition 1000 10 {
+            [string match {*table size: 8*} [r debug HTSTATS 0]]
+        } else {
+            puts [r debug HTSTATS 0]
+            fail "hash tables weren't resize."
+        }
+    } {} {needs:debug}
+
+    test "Redis can rewind and trigger smaller slot resizing" {
+        # hashslot(foo) is 12182
+        # hashslot(alice) is 749, smaller than hashslot(foo),
+        # attempt to trigger a resize on it, see details in #12802.
+        for {set j 1} {$j <= 128} {incr j} {
+            r set "{alice}$j" a
+        }
+
+        # disable resizing, the reason for not using slow bgsave is because
+        # it will hit the dict_force_resize_ratio.
+        r debug dict-resizing 0
+
+        for {set j 1} {$j <= 123} {incr j} {
+            r del "{alice}$j"
+        }
+
+        # enable resizing
+        r debug dict-resizing 1
+
+        # waiting for serverCron to resize the tables
+        wait_for_condition 1000 10 {
+            [string match {*table size: 16*} [r debug HTSTATS 0]]
+        } else {
+            puts [r debug HTSTATS 0]
+            fail "hash tables weren't resize."
+        }
+    } {} {needs:debug}
+}
+
+start_server {tags {"other external:skip"}} {
+    test "Redis can resize empty dict" {
+        # Write and then delete 128 keys, creating an empty dict
+        r flushall
+        
+        # Add one key to the db just to create the dict and get its initial size
+        r set x 1
+        set initial_size [dict get [r memory stats] db.9 overhead.hashtable.main] 
+        
+        # Now add 128 keys and then delete them
+        for {set j 1} {$j <= 128} {incr j} {
+            r set $j{b} a
+        }
+        
+        for {set j 1} {$j <= 128} {incr j} {
+            r del $j{b}
+        }
+        
+        # dict must have expanded. Verify it eventually shrinks back to its initial size.
+        wait_for_condition 100 50 {
+            [dict get [r memory stats] db.9 overhead.hashtable.main] == $initial_size
+        } else {
+            fail "dict did not resize in time to its initial size"
+        }
+    }
+}

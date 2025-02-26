@@ -5,35 +5,15 @@
  *
  * ----------------------------------------------------------------------------
  *
- * Copyright (c) 2014, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2014-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #include "server.h"
+#include "hdr_histogram.h"
 
 /* Dictionary type for latency events. */
 int dictStringKeyCompare(dict *d, const void *key1, const void *key2) {
@@ -58,39 +38,6 @@ dictType latencyTimeSeriesDictType = {
 };
 
 /* ------------------------- Utility functions ------------------------------ */
-
-#ifdef __linux__
-#include <sys/prctl.h>
-/* Returns 1 if Transparent Huge Pages support is enabled in the kernel.
- * Otherwise (or if we are unable to check) 0 is returned. */
-int THPIsEnabled(void) {
-    char buf[1024];
-
-    FILE *fp = fopen("/sys/kernel/mm/transparent_hugepage/enabled","r");
-    if (!fp) return 0;
-    if (fgets(buf,sizeof(buf),fp) == NULL) {
-        fclose(fp);
-        return 0;
-    }
-    fclose(fp);
-    return (strstr(buf,"[always]") != NULL) ? 1 : 0;
-}
-
-/* since linux-3.5, kernel supports to set the state of the "THP disable" flag
- * for the calling thread. PR_SET_THP_DISABLE is defined in linux/prctl.h */
-int THPDisable(void) {
-    int ret = -EINVAL;
-
-    if (!server.disable_thp)
-        return ret;
-
-#ifdef PR_SET_THP_DISABLE
-    ret = prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-#endif
-
-    return ret;
-}
-#endif
 
 /* Report the amount of AnonHugePages in smap, in bytes. If the return
  * value of the function is non-zero, the process is being targeted by
@@ -256,7 +203,7 @@ sds createLatencyReport(void) {
     if (dictSize(server.latency_events) == 0 &&
         server.latency_monitor_threshold == 0)
     {
-        report = sdscat(report,"I'm sorry, Dave, I can't do that. Latency monitoring is disabled in this Redis instance. You may use \"CONFIG SET latency-monitor-threshold <milliseconds>.\" in order to enable it. If we weren't in a deep space mission I'd suggest to take a look at https://redis.io/topics/latency-monitor.\n");
+        report = sdscat(report,"I'm sorry, Dave, I can't do that. Latency monitoring is disabled in this Redis instance. You may use \"CONFIG SET latency-monitor-threshold <milliseconds>.\" in order to enable it. If we weren't in a deep space mission I'd suggest to take a look at https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency-monitor.\n");
         return report;
     }
 
@@ -311,7 +258,7 @@ sds createLatencyReport(void) {
 
         /* Potentially commands. */
         if (!strcasecmp(event,"command")) {
-            if (server.slowlog_log_slower_than < 0) {
+            if (server.slowlog_log_slower_than < 0 || server.slowlog_max_len == 0) {
                 advise_slowlog_enabled = 1;
                 advices++;
             } else if (server.slowlog_log_slower_than/1000 >
@@ -758,3 +705,14 @@ nodataerr:
         "No samples available for event '%s'", (char*) c->argv[2]->ptr);
 }
 
+void durationAddSample(int type, monotime duration) {
+    if (type >= EL_DURATION_TYPE_NUM) {
+        return;
+    }
+    durationStats* ds = &server.duration_stats[type];
+    ds->cnt++;
+    ds->sum += duration;
+    if (duration > ds->max) {
+        ds->max = duration;
+    }
+}

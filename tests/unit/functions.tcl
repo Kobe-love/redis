@@ -38,7 +38,7 @@ start_server {tags {"scripting"}} {
             r function load [get_function_code LUA {bad\0foramat} test {return 'hello1'}]
         } e
         set _ $e
-    } {*Library names can only contain letters and numbers*}
+    } {*Library names can only contain letters, numbers, or underscores(_)*}
 
     test {FUNCTION - Create library with unexisting engine} {
         catch {
@@ -64,7 +64,8 @@ start_server {tags {"scripting"}} {
     } {hello1}
 
     test {FUNCTION - test replace argument with failure keeps old libraries} {
-         catch {r function create LUA test REPLACE {error}}
+        catch {r function load REPLACE [get_function_code LUA test test {error}]} e
+        assert_match {ERR Error compiling function*} $e
         r fcall test 0
     } {hello1}
 
@@ -117,7 +118,7 @@ start_server {tags {"scripting"}} {
             r function bad_subcommand
         } e
         set _ $e
-    } {*Unknown subcommand*}
+    } {*unknown subcommand*}
 
     test {FUNCTION - test loading from rdb} {
         r debug reload
@@ -205,18 +206,18 @@ start_server {tags {"scripting"}} {
     test {FUNCTION - test function restore with wrong number of arguments} {
         catch {r function restore arg1 args2 arg3} e
         set _ $e
-    } {*Unknown subcommand or wrong number of arguments for 'restore'. Try FUNCTION HELP.}
+    } {*unknown subcommand or wrong number of arguments for 'restore'. Try FUNCTION HELP.}
 
     test {FUNCTION - test fcall_ro with write command} {
         r function load REPLACE [get_no_writes_function_code lua test test {return redis.call('set', 'x', '1')}]
-        catch { r fcall_ro test 0 } e
+        catch { r fcall_ro test 1 x } e
         set _ $e
     } {*Write commands are not allowed from read-only scripts*}
 
     test {FUNCTION - test fcall_ro with read only commands} {
         r function load REPLACE [get_no_writes_function_code lua test test {return redis.call('get', 'x')}]
         r set x 1
-        r fcall_ro test 0
+        r fcall_ro test 1 x
     } {1}
 
     test {FUNCTION - test keys and argv} {
@@ -293,12 +294,37 @@ start_server {tags {"scripting"}} {
         assert_match {} [r function list]
     }
 
+    test {FUNCTION - async function flush rebuilds Lua VM without causing race condition between main and lazyfree thread} {
+        # LAZYFREE_THRESHOLD is 64
+        for {set i 0} {$i < 1000} {incr i} {
+            r function load [get_function_code lua test$i test$i {local a = 1 while true do a = a + 1 end}]
+        }
+        assert_morethan [s used_memory_vm_functions] 100000
+        r config resetstat
+        r function flush async
+        assert_lessthan [s used_memory_vm_functions] 40000
+
+        # Wait for the completion of lazy free for both functions and engines.
+        set start_time [clock seconds]
+        while {1} {
+            # Tests for race conditions between async function flushes and main thread Lua VM operations.
+            r function load REPLACE [get_function_code lua test test {local a = 1 while true do a = a + 1 end}]
+            if {[s lazyfreed_objects] == 1001 || [expr {[clock seconds] - $start_time}] > 5} {
+                break
+            }
+        }
+        if {[s lazyfreed_objects] != 1001} {
+            error "Timeout or unexpected number of lazyfreed_objects: [s lazyfreed_objects]"
+        }
+        assert_match {{library_name test engine LUA functions {{name test description {} flags {}}}}} [r function list]
+    }
+
     test {FUNCTION - test function wrong argument} {
         catch {r function flush bad_arg} e
         assert_match {*only supports SYNC|ASYNC*} $e
 
         catch {r function flush sync extra_arg} e
-        assert_match {*Unknown subcommand or wrong number of arguments for 'flush'. Try FUNCTION HELP.} $e
+        assert_match {*unknown subcommand or wrong number of arguments for 'flush'. Try FUNCTION HELP.} $e
     }
 }
 
@@ -410,7 +436,7 @@ start_server {tags {"scripting repl external:skip"}} {
 
         test "FUNCTION - function effect is replicated to replica" {
             r function load REPLACE [get_function_code LUA test test {return redis.call('set', 'x', '1')}]
-            r fcall test 0
+            r fcall test 1 x
             assert {[r get x] eq {1}}
             wait_for_condition 150 100 {
                 [r -1 get x] eq {1}
@@ -421,10 +447,10 @@ start_server {tags {"scripting repl external:skip"}} {
 
         test "FUNCTION - modify key space of read only replica" {
             catch {
-                r -1 fcall test 0
+                r -1 fcall test 1 x
             } e
             set _ $e
-        } {*Can not run script with write flag on readonly replica*}
+        } {READONLY You can't write against a read only replica.}
     }
 }
 
@@ -597,7 +623,7 @@ start_server {tags {"scripting"}} {
             }
         } e
         set _ $e
-    } {*Function names can only contain letters and numbers and must be at least one character long*}
+    } {*Library names can only contain letters, numbers, or underscores(_) and must be at least one character long*}
 
     test {LIBRARIES - test registration with empty name} {
         catch {
@@ -606,7 +632,7 @@ start_server {tags {"scripting"}} {
             }
         } e
         set _ $e
-    } {*Function names can only contain letters and numbers and must be at least one character long*}
+    } {*Library names can only contain letters, numbers, or underscores(_) and must be at least one character long*}
 
     test {LIBRARIES - math.random from function load} {
         catch {
@@ -624,16 +650,16 @@ start_server {tags {"scripting"}} {
             }
         } e
         set _ $e
-    } {*attempt to call field 'call' (a nil value)*}
+    } {*attempted to access nonexistent global variable 'call'*}
 
-    test {LIBRARIES - redis.call from function load} {
+    test {LIBRARIES - redis.setresp from function load} {
         catch {
             r function load replace {#!lua name=lib2
                 return redis.setresp(3)
             }
         } e
         set _ $e
-    } {*attempt to call field 'setresp' (a nil value)*}
+    } {*attempted to access nonexistent global variable 'setresp'*}
 
     test {LIBRARIES - redis.set_repl from function load} {
         catch {
@@ -642,7 +668,16 @@ start_server {tags {"scripting"}} {
             }
         } e
         set _ $e
-    } {*attempt to call field 'set_repl' (a nil value)*}
+    } {*attempted to access nonexistent global variable 'set_repl'*}
+
+    test {LIBRARIES - redis.acl_check_cmd from function load} {
+        catch {
+            r function load replace {#!lua name=lib2
+                return redis.acl_check_cmd('set','xx',1)
+            }
+        } e
+        set _ $e
+    } {*attempted to access nonexistent global variable 'acl_check_cmd'*}
 
     test {LIBRARIES - malicious access test} {
         # the 'library' API is not exposed inside a
@@ -669,37 +704,18 @@ start_server {tags {"scripting"}} {
                 end)
             end)
         }
-        assert_equal {OK} [r fcall f1 0]
+        catch {[r fcall f1 0]} e
+        assert_match {*Attempt to modify a readonly table*} $e
 
         catch {[r function load {#!lua name=lib2
             redis.math.random()
         }]} e
-        assert_match {*can only be called inside a script invocation*} $e
-
-        catch {[r function load {#!lua name=lib2
-            redis.math.randomseed()
-        }]} e
-        assert_match {*can only be called inside a script invocation*} $e
+        assert_match {*Script attempted to access nonexistent global variable 'math'*} $e
 
         catch {[r function load {#!lua name=lib2
             redis.redis.call('ping')
         }]} e
-        assert_match {*can only be called inside a script invocation*} $e
-
-        catch {[r function load {#!lua name=lib2
-            redis.redis.pcall('ping')
-        }]} e
-        assert_match {*can only be called inside a script invocation*} $e
-
-        catch {[r function load {#!lua name=lib2
-            redis.redis.setresp(3)
-        }]} e
-        assert_match {*can only be called inside a script invocation*} $e
-
-        catch {[r function load {#!lua name=lib2
-            redis.redis.set_repl(redis.redis.REPL_NONE)
-        }]} e
-        assert_match {*can only be called inside a script invocation*} $e
+        assert_match {*Script attempted to access nonexistent global variable 'redis'*} $e
 
         catch {[r fcall f2 0]} e
         assert_match {*can only be called on FUNCTION LOAD command*} $e
@@ -756,7 +772,7 @@ start_server {tags {"scripting"}} {
             }
         } e
         set _ $e
-    } {*attempted to create global variable 'a'*}
+    } {*Attempt to modify a readonly table*}
 
     test {LIBRARIES - named arguments} {
         r function load {#!lua name=lib
@@ -986,7 +1002,7 @@ start_server {tags {"scripting"}} {
         assert_match {*command not allowed when used memory*} $e
 
         r config set maxmemory 0
-    }
+    } {OK} {needs:config-maxmemory}
 
     test {FUNCTION - verify allow-omm allows running any command} {
         r FUNCTION load replace {#!lua name=f1
@@ -999,11 +1015,11 @@ start_server {tags {"scripting"}} {
 
         r config set maxmemory 1
 
-        assert_match {OK} [r fcall f1 1 k]
+        assert_match {OK} [r fcall f1 1 x]
         assert_match {1} [r get x]
 
         r config set maxmemory 0
-    }
+    } {OK} {needs:config-maxmemory}
 }
 
 start_server {tags {"scripting"}} {
@@ -1047,7 +1063,7 @@ start_server {tags {"scripting"}} {
                 callback = function() return redis.call('set', 'x', 1) end
             }
         }
-        catch {r fcall_ro f1 0} e
+        catch {r fcall_ro f1 1 x} e
         set _ $e
     } {*Can not execute a script with write flag using \*_ro command*}
 
@@ -1059,7 +1075,7 @@ start_server {tags {"scripting"}} {
                 flags = {'no-writes'}
             }
         }
-        catch {r fcall f1 0} e
+        catch {r fcall f1 1 x} e
         set _ $e
     } {*Write commands are not allowed from read-only scripts*}
 
@@ -1070,11 +1086,11 @@ start_server {tags {"scripting"}} {
 
         r config set maxmemory 1
 
-        catch {[r fcall f1 1 k]} e
-        assert_match {*can not run it when used memory > 'maxmemory'*} $e
+        catch {[r fcall f1 1 x]} e
+        assert_match {OOM *when used memory > 'maxmemory'*} $e
 
         r config set maxmemory 0
-    }
+    } {OK} {needs:config-maxmemory}
 
     test {FUNCTION - deny oom on no-writes function} {
         r FUNCTION load replace {#!lua name=test
@@ -1083,14 +1099,11 @@ start_server {tags {"scripting"}} {
 
         r config set maxmemory 1
 
-        catch {r fcall f1 1 k} e
-        assert_match {*can not run it when used memory > 'maxmemory'*} $e
-
-        catch {r fcall_ro f1 1 k} e
-        assert_match {*can not run it when used memory > 'maxmemory'*} $e
+        assert_equal [r fcall f1 1 k] hello
+        assert_equal [r fcall_ro f1 1 k] hello
 
         r config set maxmemory 0
-    }
+    } {OK} {needs:config-maxmemory}
 
     test {FUNCTION - allow stale} {
         r FUNCTION load replace {#!lua name=test
@@ -1104,12 +1117,12 @@ start_server {tags {"scripting"}} {
         r replicaof 127.0.0.1 1
 
         catch {[r fcall f1 0]} e
-        assert_match {*'allow-stale' flag is not set on the script*} $e
+        assert_match {MASTERDOWN *} $e
 
         assert_equal {hello} [r fcall f2 0]
 
-        catch {[r fcall f3 0]} e
-        assert_match {*Can not execute the command on a stale replica*} $e
+        catch {[r fcall f3 1 x]} e
+        assert_match {ERR *Can not execute the command on a stale replica*} $e
 
         assert_match {*redis_version*} [r fcall f4 0]
 
@@ -1160,6 +1173,23 @@ start_server {tags {"scripting"}} {
         r function stats
     } {running_script {} engines {LUA {libraries_count 1 functions_count 1}}}
 
+    test {FUNCTION - test function stats on loading failure} {
+        r FUNCTION FLUSH
+
+        r FUNCTION load {#!lua name=test1
+            redis.register_function('f1', function() return 1 end)
+            redis.register_function('f2', function() return 1 end)
+        }
+
+        catch {r FUNCTION load {#!lua name=test1
+            redis.register_function('f3', function() return 1 end)
+        }} e
+        assert_match "*Library 'test1' already exists*" $e
+        
+
+        r function stats
+    } {running_script {} engines {LUA {libraries_count 1 functions_count 2}}}
+
     test {FUNCTION - function stats cleaned after flush} {
         r function flush
         r function stats
@@ -1198,4 +1228,32 @@ start_server {tags {"scripting"}} {
             redis.register_function('foo', function() return 1 end)
         }
     } {foo}
+
+    test {FUNCTION - trick global protection 1} {
+        r FUNCTION FLUSH
+
+        r FUNCTION load {#!lua name=test1
+            redis.register_function('f1', function() 
+                mt = getmetatable(_G)
+                original_globals = mt.__index
+                original_globals['redis'] = function() return 1 end
+            end)
+        }
+
+        catch {[r fcall f1 0]} e
+        set _ $e
+    } {*Attempt to modify a readonly table*}
+
+    test {FUNCTION - test getmetatable on script load} {
+        r FUNCTION FLUSH
+
+        catch {
+            r FUNCTION load {#!lua name=test1
+                mt = getmetatable(_G)
+            }
+        } e
+
+        set _ $e
+    } {*Script attempted to access nonexistent global variable 'getmetatable'*}
+
 }

@@ -1,35 +1,13 @@
 /* Redis benchmark utility.
  *
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 #include "fmacros.h"
-#include "version.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -167,7 +145,6 @@ typedef struct clusterNode {
     sds replicate;  /* Master ID if node is a slave */
     int *slots;
     int slots_count;
-    int current_slot_index;
     int *updated_slots;         /* Used by updateClusterSlotsConfiguration */
     int updated_slots_count;    /* Used by updateClusterSlotsConfiguration */
     int replicas_count;
@@ -186,13 +163,11 @@ typedef struct redisConfig {
 } redisConfig;
 
 /* Prototypes */
-char *redisGitSHA1(void);
-char *redisGitDirty(void);
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 static void createMissingClients(client c);
 static benchmarkThread *createBenchmarkThread(int index);
 static void freeBenchmarkThread(benchmarkThread *thread);
-static void freeBenchmarkThreads();
+static void freeBenchmarkThreads(void);
 static void *execBenchmarkThread(void *ptr);
 static clusterNode *createClusterNode(char *ip, int port);
 static redisConfig *getRedisConfig(const char *ip, int port,
@@ -201,23 +176,9 @@ static redisContext *getRedisContext(const char *ip, int port,
                                      const char *hostsocket);
 static void freeRedisConfig(redisConfig *cfg);
 static int fetchClusterSlotsConfiguration(client c);
-static void updateClusterSlotsConfiguration();
+static void updateClusterSlotsConfiguration(void);
 int showThroughput(struct aeEventLoop *eventLoop, long long id,
                    void *clientData);
-
-static sds benchmarkVersion(void) {
-    sds version;
-    version = sdscatprintf(sdsempty(), "%s", REDIS_VERSION);
-
-    /* Add git commit and working tree status when available */
-    if (strtoll(redisGitSHA1(),NULL,16)) {
-        version = sdscatprintf(version, " (git:%s", redisGitSHA1());
-        if (strtoll(redisGitDirty(),NULL,10))
-            version = sdscatprintf(version, "-dirty");
-        version = sdscat(version, ")");
-    }
-    return version;
-}
 
 /* Dict callbacks */
 static uint64_t dictSdsHash(const void *key);
@@ -229,19 +190,13 @@ static long long ustime(void) {
     long long ust;
 
     gettimeofday(&tv, NULL);
-    ust = ((long)tv.tv_sec)*1000000;
+    ust = ((long long)tv.tv_sec)*1000000;
     ust += tv.tv_usec;
     return ust;
 }
 
 static long long mstime(void) {
-    struct timeval tv;
-    long long mst;
-
-    gettimeofday(&tv, NULL);
-    mst = ((long long)tv.tv_sec)*1000;
-    mst += tv.tv_usec/1000;
-    return mst;
+    return ustime()/1000;
 }
 
 static uint64_t dictSdsHash(const void *key) {
@@ -326,10 +281,11 @@ static redisConfig *getRedisConfig(const char *ip, int port,
     c = getRedisContext(ip, port, hostsocket);
     if (c == NULL) {
         freeRedisConfig(cfg);
-        return NULL;
+        exit(1);
     }
     redisAppendCommand(c, "CONFIG GET %s", "save");
     redisAppendCommand(c, "CONFIG GET %s", "appendonly");
+    int abort_test = 0;
     int i = 0;
     void *r = NULL;
     for (; i < 2; i++) {
@@ -338,7 +294,6 @@ static redisConfig *getRedisConfig(const char *ip, int port,
         reply = res == REDIS_OK ? ((redisReply *) r) : NULL;
         if (res != REDIS_OK || !r) goto fail;
         if (reply->type == REDIS_REPLY_ERROR) {
-            fprintf(stderr, "ERROR: %s\n", reply->str);
             goto fail;
         }
         if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2) goto fail;
@@ -354,15 +309,14 @@ static redisConfig *getRedisConfig(const char *ip, int port,
     redisFree(c);
     return cfg;
 fail:
-    fprintf(stderr, "ERROR: failed to fetch CONFIG from ");
-    if (hostsocket == NULL) fprintf(stderr, "%s:%d\n", ip, port);
-    else fprintf(stderr, "%s\n", hostsocket);
-    int abort_test = 0;
     if (reply && reply->type == REDIS_REPLY_ERROR &&
-        (!strncmp(reply->str,"NOAUTH",6) ||
-         !strncmp(reply->str,"WRONGPASS",9) ||
-         !strncmp(reply->str,"NOPERM",6)))
+        !strncmp(reply->str,"NOAUTH",6)) {
+        if (hostsocket == NULL)
+            fprintf(stderr, "Node %s:%d replied with error:\n%s\n", ip, port, reply->str);
+        else
+            fprintf(stderr, "Node %s replied with error:\n%s\n", hostsocket, reply->str);
         abort_test = 1;
+    }
     freeReplyObject(reply);
     redisFree(c);
     freeRedisConfig(cfg);
@@ -441,7 +395,6 @@ static void setClusterKeyHashTag(client c) {
     assert(c->thread_id >= 0);
     clusterNode *node = c->cluster_node;
     assert(node);
-    assert(node->current_slot_index < node->slots_count);
     int is_updating_slots = 0;
     atomicGet(config.is_updating_slots, is_updating_slots);
     /* If updateClusterSlotsConfiguration is updating the slots array,
@@ -451,7 +404,7 @@ static void setClusterKeyHashTag(client c) {
      * updateClusterSlotsConfiguration won't actually do anything, since
      * the updated_slots_count array will be already NULL. */
     if (is_updating_slots) updateClusterSlotsConfiguration();
-    int slot = node->slots[node->current_slot_index];
+    int slot = node->slots[rand() % node->slots_count];
     const char *tag = crc16_slot_table[slot];
     int taglen = strlen(tag);
     size_t i;
@@ -846,6 +799,10 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
     }
     if (config.idlemode == 0)
         aeCreateFileEvent(el,c->context->fd,AE_WRITABLE,writeHandler,c);
+    else
+        /* In idle mode, clients still need to register readHandler for catching errors */
+        aeCreateFileEvent(el,c->context->fd,AE_READABLE,readHandler,c);
+
     listAddNodeTail(config.clients,c);
     atomicIncr(config.liveclients, 1);
     atomicGet(config.slots_last_update, c->slots_last_update);
@@ -961,7 +918,7 @@ static void showLatencyReport(void) {
     }
 }
 
-static void initBenchmarkThreads() {
+static void initBenchmarkThreads(void) {
     int i;
     if (config.threads) freeBenchmarkThreads();
     config.threads = zmalloc(config.num_threads * sizeof(benchmarkThread*));
@@ -971,7 +928,7 @@ static void initBenchmarkThreads() {
     }
 }
 
-static void startBenchmarkThreads() {
+static void startBenchmarkThreads(void) {
     int i;
     for (i = 0; i < config.num_threads; i++) {
         benchmarkThread *t = config.threads[i];
@@ -1038,7 +995,7 @@ static void freeBenchmarkThread(benchmarkThread *thread) {
     zfree(thread);
 }
 
-static void freeBenchmarkThreads() {
+static void freeBenchmarkThreads(void) {
     int i = 0;
     for (; i < config.num_threads; i++) {
         benchmarkThread *thread = config.threads[i];
@@ -1067,7 +1024,6 @@ static clusterNode *createClusterNode(char *ip, int port) {
     node->replicas_count = 0;
     node->slots = zmalloc(CLUSTER_SLOTS * sizeof(int));
     node->slots_count = 0;
-    node->current_slot_index = 0;
     node->updated_slots = NULL;
     node->updated_slots_count = 0;
     node->migrating = NULL;
@@ -1099,7 +1055,7 @@ static void freeClusterNode(clusterNode *node) {
     zfree(node);
 }
 
-static void freeClusterNodes() {
+static void freeClusterNodes(void) {
     int i = 0;
     for (; i < config.cluster_node_count; i++) {
         clusterNode *n = config.cluster_nodes[i];
@@ -1121,7 +1077,7 @@ static clusterNode **addClusterNode(clusterNode *node) {
 /* TODO: This should be refactored to use CLUSTER SLOTS, the migrating/importing
  * information is anyway not used.
  */
-static int fetchClusterConfiguration() {
+static int fetchClusterConfiguration(void) {
     int success = 1;
     redisContext *ctx = NULL;
     redisReply *reply =  NULL;
@@ -1380,7 +1336,7 @@ cleanup:
 }
 
 /* Atomically update the new slots configuration. */
-static void updateClusterSlotsConfiguration() {
+static void updateClusterSlotsConfiguration(void) {
     pthread_mutex_lock(&config.is_updating_slots_mutex);
     atomicSet(config.is_updating_slots, 1);
     int i;
@@ -1390,7 +1346,6 @@ static void updateClusterSlotsConfiguration() {
             int *oldslots = node->slots;
             node->slots = node->updated_slots;
             node->slots_count = node->updated_slots_count;
-            node->current_slot_index = 0;
             node->updated_slots = NULL;
             node->updated_slots_count = 0;
             zfree(oldslots);
@@ -1417,6 +1372,7 @@ int parseOptions(int argc, char **argv) {
     int i;
     int lastarg;
     int exit_status = 1;
+    char *tls_usage;
 
     for (i = 1; i < argc; i++) {
         lastarg = (i == (argc-1));
@@ -1425,7 +1381,7 @@ int parseOptions(int argc, char **argv) {
             if (lastarg) goto invalid;
             config.numclients = atoi(argv[++i]);
         } else if (!strcmp(argv[i],"-v") || !strcmp(argv[i], "--version")) {
-            sds version = benchmarkVersion();
+            sds version = cliVersion();
             printf("redis-benchmark %s\n", version);
             sdsfree(version);
             exit(0);
@@ -1442,6 +1398,10 @@ int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i],"-p")) {
             if (lastarg) goto invalid;
             config.conn_info.hostport = atoi(argv[++i]);
+            if (config.conn_info.hostport < 0 || config.conn_info.hostport > 65535) {
+                fprintf(stderr, "Invalid server port.\n");
+                exit(1);
+            }
         } else if (!strcmp(argv[i],"-s")) {
             if (lastarg) goto invalid;
             config.hostsocket = strdup(argv[++i]);
@@ -1455,6 +1415,10 @@ int parseOptions(int argc, char **argv) {
             config.conn_info.user = sdsnew(argv[++i]);
         } else if (!strcmp(argv[i],"-u") && !lastarg) {
             parseRedisUri(argv[++i],"redis-benchmark",&config.conn_info,&config.tls);
+            if (config.conn_info.hostport < 0 || config.conn_info.hostport > 65535) {
+                fprintf(stderr, "Invalid server port.\n");
+                exit(1);
+            }
             config.input_dbnumstr = sdsfromlonglong(config.conn_info.input_dbnum);
         } else if (!strcmp(argv[i],"-3")) {
             config.resp3 = 1;
@@ -1490,6 +1454,11 @@ int parseOptions(int argc, char **argv) {
             fprintf(stderr,
                     "WARNING: -e option has no effect. "
                     "We now immediately exit on error to avoid false results.\n");
+        } else if (!strcmp(argv[i],"--seed")) {
+            if (lastarg) goto invalid;
+            int rand_seed = atoi(argv[++i]);
+            srandom(rand_seed);
+            init_genrand64(rand_seed);
         } else if (!strcmp(argv[i],"-t")) {
             if (lastarg) goto invalid;
             /* We get the list of tests to run as a string in the form
@@ -1570,8 +1539,31 @@ invalid:
     printf("Invalid option \"%s\" or option argument missing\n\n",argv[i]);
 
 usage:
+    tls_usage =
+#ifdef USE_OPENSSL
+" --tls              Establish a secure TLS connection.\n"
+" --sni <host>       Server name indication for TLS.\n"
+" --cacert <file>    CA Certificate file to verify with.\n"
+" --cacertdir <dir>  Directory where trusted CA certificates are stored.\n"
+"                    If neither cacert nor cacertdir are specified, the default\n"
+"                    system-wide trusted root certs configuration will apply.\n"
+" --insecure         Allow insecure TLS connection by skipping cert validation.\n"
+" --cert <file>      Client certificate to authenticate with.\n"
+" --key <file>       Private key file to authenticate with.\n"
+" --tls-ciphers <list> Sets the list of preferred ciphers (TLSv1.2 and below)\n"
+"                    in order of preference from highest to lowest separated by colon (\":\").\n"
+"                    See the ciphers(1ssl) manpage for more information about the syntax of this string.\n"
+#ifdef TLS1_3_VERSION
+" --tls-ciphersuites <list> Sets the list of preferred ciphersuites (TLSv1.3)\n"
+"                    in order of preference from highest to lowest separated by colon (\":\").\n"
+"                    See the ciphers(1ssl) manpage for more information about the syntax of this string,\n"
+"                    and specifically for TLSv1.3 ciphersuites.\n"
+#endif
+#endif
+"";
+
     printf(
-"%s%s", /* Split to avoid strings longer than 4095 (-Woverlength-strings). */
+"%s%s%s", /* Split to avoid strings longer than 4095 (-Woverlength-strings). */
 "Usage: redis-benchmark [OPTIONS] [COMMAND ARGS...]\n\n"
 "Options:\n"
 " -h <hostname>      Server hostname (default 127.0.0.1)\n"
@@ -1579,8 +1571,13 @@ usage:
 " -s <socket>        Server socket (overrides host and port)\n"
 " -a <password>      Password for Redis Auth\n"
 " --user <username>  Used to send ACL style 'AUTH username pass'. Needs -a.\n"
-" -u <uri>           Server URI.\n"
-" -c <clients>       Number of parallel connections (default 50)\n"
+" -u <uri>           Server URI on format redis://user:password@host:port/dbnum\n"
+"                    User, password and dbnum are optional. For authentication\n"
+"                    without a username, use username 'default'. For TLS, use\n"
+"                    the scheme 'rediss'.\n"
+" -c <clients>       Number of parallel connections (default 50).\n"
+"                    Note: If --cluster is used then number of clients has to be\n"
+"                    the same or higher than the number of nodes.\n"
 " -n <requests>      Total number of requests (default 100000)\n"
 " -d <size>          Data size of SET/GET value in bytes (default 3)\n"
 " --dbnum <db>       SELECT the specified db number (default 0)\n"
@@ -1613,28 +1610,10 @@ usage:
 "                    on the command line.\n"
 " -I                 Idle mode. Just open N idle connections and wait.\n"
 " -x                 Read last argument from STDIN.\n"
-#ifdef USE_OPENSSL
-" --tls              Establish a secure TLS connection.\n"
-" --sni <host>       Server name indication for TLS.\n"
-" --cacert <file>    CA Certificate file to verify with.\n"
-" --cacertdir <dir>  Directory where trusted CA certificates are stored.\n"
-"                    If neither cacert nor cacertdir are specified, the default\n"
-"                    system-wide trusted root certs configuration will apply.\n"
-" --insecure         Allow insecure TLS connection by skipping cert validation.\n"
-" --cert <file>      Client certificate to authenticate with.\n"
-" --key <file>       Private key file to authenticate with.\n"
-" --tls-ciphers <list> Sets the list of preferred ciphers (TLSv1.2 and below)\n"
-"                    in order of preference from highest to lowest separated by colon (\":\").\n"
-"                    See the ciphers(1ssl) manpage for more information about the syntax of this string.\n"
-#ifdef TLS1_3_VERSION
-" --tls-ciphersuites <list> Sets the list of preferred ciphersuites (TLSv1.3)\n"
-"                    in order of preference from highest to lowest separated by colon (\":\").\n"
-"                    See the ciphers(1ssl) manpage for more information about the syntax of this string,\n"
-"                    and specifically for TLSv1.3 ciphersuites.\n"
-#endif
-#endif
+" --seed <num>       Set the seed for random number generator. Default seed is based on time.\n",
+tls_usage,
 " --help             Output this help and exit.\n"
-" --version          Output version and exit.\n\n",
+" --version          Output version and exit.\n\n"
 "Examples:\n\n"
 " Run the benchmark with the default configuration against 127.0.0.1:6379:\n"
 "   $ redis-benchmark\n\n"
@@ -1870,8 +1849,12 @@ int main(int argc, char **argv) {
             sds_args[argc] = readArgFromStdin();
             argc++;
         }
+        /* Setup argument length */
+        size_t *argvlen = zmalloc(argc*sizeof(size_t));
+        for (i = 0; i < argc; i++)
+            argvlen[i] = sdslen(sds_args[i]);
         do {
-            len = redisFormatCommandArgv(&cmd,argc,(const char**)sds_args,NULL);
+            len = redisFormatCommandArgv(&cmd,argc,(const char**)sds_args,argvlen);
             // adjust the datasize to the parsed command
             config.datasize = len;
             benchmark(title,cmd,len);
@@ -1881,6 +1864,7 @@ int main(int argc, char **argv) {
 
         sdsfree(title);
         if (config.redis_config != NULL) freeRedisConfig(config.redis_config);
+        zfree(argvlen);
         return 0;
     }
 
@@ -2024,6 +2008,12 @@ int main(int argc, char **argv) {
             free(cmd);
             sdsfree(key_placeholder);
         }
+
+        if (test_is_selected("xadd")) {
+            len = redisFormatCommand(&cmd,"XADD mystream%s * myfield %s", tag, data);
+            benchmark("XADD",cmd,len);
+            free(cmd); 
+        }        
 
         if (!config.csv) printf("\n");
     } while(config.loop);

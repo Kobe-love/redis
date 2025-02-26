@@ -11,7 +11,10 @@ int cmd_set(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
 
 int cmd_get(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     UNUSED(argv);
-    UNUSED(argc);
+
+    if (argc > 4) /* For testing */
+        return RedisModule_WrongArity(ctx);
+
     RedisModule_ReplyWithSimpleString(ctx, "OK");
     return REDISMODULE_OK;
 }
@@ -32,12 +35,23 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     if (RedisModule_Init(ctx, "subcommands", 1, REDISMODULE_APIVER_1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
 
+    /* Module command names cannot contain special characters. */
+    RedisModule_Assert(RedisModule_CreateCommand(ctx,"subcommands.char\r",NULL,"",0,0,0) == REDISMODULE_ERR);
+    RedisModule_Assert(RedisModule_CreateCommand(ctx,"subcommands.char\n",NULL,"",0,0,0) == REDISMODULE_ERR);
+    RedisModule_Assert(RedisModule_CreateCommand(ctx,"subcommands.char ",NULL,"",0,0,0) == REDISMODULE_ERR);
+
     if (RedisModule_CreateCommand(ctx,"subcommands.bitarray",NULL,"",0,0,0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
     RedisModuleCommand *parent = RedisModule_GetCommand(ctx,"subcommands.bitarray");
 
     if (RedisModule_CreateSubcommand(parent,"set",cmd_set,"",0,0,0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
+
+    /* Module subcommand names cannot contain special characters. */
+    RedisModule_Assert(RedisModule_CreateSubcommand(parent,"char|",cmd_set,"",0,0,0) == REDISMODULE_ERR);
+    RedisModule_Assert(RedisModule_CreateSubcommand(parent,"char@",cmd_set,"",0,0,0) == REDISMODULE_ERR);
+    RedisModule_Assert(RedisModule_CreateSubcommand(parent,"char=",cmd_set,"",0,0,0) == REDISMODULE_ERR);
+
     RedisModuleCommand *subcmd = RedisModule_GetCommand(ctx,"subcommands.bitarray|set");
     RedisModuleCommandInfo cmd_set_info = {
         .version = REDISMODULE_COMMAND_INFO_VERSION,
