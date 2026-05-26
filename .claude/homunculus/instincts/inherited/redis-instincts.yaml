@@ -1,0 +1,692 @@
+# Instincts generated from https://github.com/Kobe-love/redis
+# Generated: 2026-05-26T03:56:36.836Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: redis-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Commit Length
+
+## Action
+
+Write moderate-length commit messages (~64 characters)
+
+## Evidence
+
+- Average commit message length: 64 chars
+- Based on 100 commits
+
+---
+id: redis-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: redis-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: redis-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: redis-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: redis-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.ts
+
+## Evidence
+
+- File pattern: *.test.ts
+- Consistent across test files
+
+---
+id: redis-test-types
+trigger: "when planning tests for a feature"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Test Types
+
+## Action
+
+Write unit, integration tests to match project standards
+
+## Evidence
+
+- Test types detected: unit, integration
+- Coverage config: no
+
+---
+id: redis-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~8x per month
+- Files: **/*.test.*, **/api/**
+
+---
+id: redis-workflow-test-driven-development
+trigger: "when adding new functionality"
+confidence: 0.8
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Workflow Test Driven Development
+
+## Action
+
+Follow the test-driven-development workflow:
+1. Write failing test
+2. Implement code to pass test
+3. Refactor if needed
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~6x per month
+- Files: **/*.test.*, **/*.spec.*, src/**/*
+
+---
+id: redis-workflow-feature-implementation-with-api-and-tests
+trigger: "when doing feature implementation with api and tests"
+confidence: 0.7
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Workflow Feature Implementation With Api And Tests
+
+## Action
+
+Follow the feature-implementation-with-api-and-tests workflow:
+1. Update or add implementation files in src/ (e.g., .c, .h)
+2. Update or add related header files in src/
+3. Update or add test files in tests/unit/ or tests/modules/
+4. Update Makefile or test infrastructure if new tests or modules are added
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~4x per month
+- Files: src/*.c, src/*.h, tests/unit/*.tcl
+
+---
+id: redis-workflow-config-or-command-addition-or-change
+trigger: "when doing config or command addition or change"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Workflow Config Or Command Addition Or Change
+
+## Action
+
+Follow the config-or-command-addition-or-change workflow:
+1. Update implementation in src/config.c, src/server.c, or related files
+2. Update redis.conf and/or tests/assets/default.conf
+3. Update or add related header files
+4. Update or add tests in tests/unit/ or tests/integration/
+5. Update documentation/comments in code
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: src/config.c, src/server.c, src/server.h
+
+---
+id: redis-workflow-bugfix-with-test
+trigger: "when doing bugfix with test"
+confidence: 0.7
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Workflow Bugfix With Test
+
+## Action
+
+Follow the bugfix-with-test workflow:
+1. Fix bug in src/*.c or src/*.h
+2. Update or add a test in tests/unit/ or tests/integration/ to cover the bug scenario
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~4x per month
+- Files: src/*.c, src/*.h, tests/unit/*.tcl
+
+---
+id: redis-workflow-documentation-or-comment-improvement
+trigger: "when doing documentation or comment improvement"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Workflow Documentation Or Comment Improvement
+
+## Action
+
+Follow the documentation-or-comment-improvement workflow:
+1. Edit or add comments in src/*.c or src/*.h
+2. Update documentation files or scripts in utils/ or docs/
+3. Sometimes update related test comments
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: src/*.c, src/*.h, utils/*.py
+
+---
+id: redis-workflow-third-party-dependency-upgrade
+trigger: "when doing third party dependency upgrade"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Workflow Third Party Dependency Upgrade
+
+## Action
+
+Follow the third-party-dependency-upgrade workflow:
+1. Update files in deps/<dependency>/
+2. Update related documentation (e.g., deps/README.md)
+3. Update Makefile or build scripts if needed
+4. Update src/ files if integration points change
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: deps/*, deps/*/*, deps/README.md
+
+---
+id: redis-workflow-test-infrastructure-or-skip-tag-update
+trigger: "when doing test infrastructure or skip tag update"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Kobe-love/redis
+---
+
+# Redis Workflow Test Infrastructure Or Skip Tag Update
+
+## Action
+
+Follow the test-infrastructure-or-skip-tag-update workflow:
+1. Update or add skip tags in tests/unit/*.tcl or tests/integration/*.tcl
+2. Update test helper scripts in tests/support/ or tests/test_helper.tcl
+3. Update Makefile or test runner scripts if needed
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: tests/unit/*.tcl, tests/integration/*.tcl, tests/support/*.tcl
+
+---
+id: redis-instinct-file-naming-snake-case
+trigger: "When creating or renaming a file in the codebase"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct File Naming Snake Case
+
+## Action
+
+Use snake_case for file names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.files: snake_case
+
+---
+id: redis-instinct-function-naming-camelCase
+trigger: "When defining a new function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Function Naming CamelCase
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.functions: camelCase
+
+---
+id: redis-instinct-class-naming-pascal-case
+trigger: "When defining a new class"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Class Naming Pascal Case
+
+## Action
+
+Use PascalCase for class names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.classes: PascalCase
+
+---
+id: redis-instinct-constant-naming-screaming-snake-case
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Constant Naming Screaming Snake Case
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: redis-instinct-import-relative
+trigger: "When importing modules in Python files"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Import Relative
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in codeStyle.importStyle: relative
+
+---
+id: redis-instinct-export-named
+trigger: "When exporting modules or functions"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Export Named
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle: named
+
+---
+id: redis-instinct-test-file-pattern
+trigger: "When creating a test file"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Test File Pattern
+
+## Action
+
+Name the file with a .test.ts suffix
+
+## Evidence
+
+- Pattern in testing.filePattern: *.test.ts
+
+---
+id: redis-instinct-test-types-unit-integration
+trigger: "When writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Test Types Unit Integration
+
+## Action
+
+Write both unit and integration tests as appropriate
+
+## Evidence
+
+- Pattern in testing.testTypes: unit, integration
+
+---
+id: redis-instinct-tdd-workflow
+trigger: "When following test-driven development"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Tdd Workflow
+
+## Action
+
+First write a failing test, then implement code to pass it, then refactor if needed
+
+## Evidence
+
+- Workflow: test-driven-development
+- Commit sequence: Write failing test → Implement code → Refactor
+
+---
+id: redis-instinct-commit-prefix-none
+trigger: "When writing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Commit Prefix None
+
+## Action
+
+Do not use a strict prefix, but describe the change clearly and concisely
+
+## Evidence
+
+- Pattern in commits.prefixes: []
+- Examples: 'Tests: improve skip tags...', 'Optimization: Use either monotonic...'
+
+---
+id: redis-instinct-commit-length-brief
+trigger: "When writing a commit message"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Commit Length Brief
+
+## Action
+
+Keep the commit message concise, typically under 70 characters
+
+## Evidence
+
+- Pattern in commits.averageLength: 64
+- Examples: 'Fix error/warning on Arm due to unsigned char.'
+
+---
+id: redis-instinct-commit-describe-scope
+trigger: "When writing a commit message"
+confidence: 0.75
+domain: git
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Commit Describe Scope
+
+## Action
+
+Describe the scope or affected area (e.g., Tests, Optimization, Fix) at the start of the message
+
+## Evidence
+
+- Examples: 'Tests: improve skip tags...', 'Optimization: Use either monotonic...'
+
+---
+id: redis-instinct-feature-implementation-with-api-and-tests
+trigger: "When someone adds a new feature or API to Redis core or modules"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Feature Implementation With Api And Tests
+
+## Action
+
+Update or add implementation files in src/, related header files, test files in tests/unit/ or tests/modules/, and update Makefile or test infrastructure if new tests or modules are added
+
+## Evidence
+
+- Workflow: feature-implementation-with-api-and-tests
+- Example commits: 'Add the deprecated_since field in command args of COMMAND DOCS (#10545)'
+
+---
+id: redis-instinct-config-or-command-addition-or-change
+trigger: "When someone adds or changes a config option or command"
+confidence: 0.93
+domain: workflow
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Config Or Command Addition Or Change
+
+## Action
+
+Update implementation in src/config.c, src/server.c, or related files; update redis.conf and/or tests/assets/default.conf; update or add related header files; update or add tests in tests/unit/ or tests/integration/; update documentation/comments in code
+
+## Evidence
+
+- Workflow: config-or-command-addition-or-change
+- Example commits: 'Update implementation in src/config.c, src/server.c, or related files'
+
+---
+id: redis-instinct-bugfix-with-test
+trigger: "When someone fixes a bug and wants to prevent regressions"
+confidence: 0.97
+domain: workflow
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Bugfix With Test
+
+## Action
+
+Fix bug in src/*.c or src/*.h and update or add a test in tests/unit/ or tests/integration/ to cover the bug scenario
+
+## Evidence
+
+- Workflow: bugfix-with-test
+- Example commits: 'Fix bug in src/*.c or src/*.h', 'Update or add a test in tests/unit/ or tests/integration/'
+
+---
+id: redis-instinct-documentation-or-comment-improvement
+trigger: "When someone wants to clarify code or update documentation"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Documentation Or Comment Improvement
+
+## Action
+
+Edit or add comments in src/*.c or src/*.h; update documentation files or scripts in utils/ or docs/; sometimes update related test comments
+
+## Evidence
+
+- Workflow: documentation-or-comment-improvement
+- Example commits: 'Edit or add comments in src/*.c or src/*.h'
+
+---
+id: redis-instinct-third-party-dependency-upgrade
+trigger: "When someone bumps or updates a third-party dependency"
+confidence: 0.88
+domain: workflow
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Third Party Dependency Upgrade
+
+## Action
+
+Update files in deps/<dependency>/; update related documentation (e.g., deps/README.md); update Makefile or build scripts if needed; update src/ files if integration points change
+
+## Evidence
+
+- Workflow: third-party-dependency-upgrade
+- Example commits: 'Update files in deps/<dependency>/'
+
+---
+id: redis-instinct-test-infrastructure-or-skip-tag-update
+trigger: "When someone needs to adjust test running conditions or infrastructure"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: Kobe-love/redis
+---
+
+# Redis Instinct Test Infrastructure Or Skip Tag Update
+
+## Action
+
+Update or add skip tags in tests/unit/*.tcl or tests/integration/*.tcl; update test helper scripts in tests/support/ or tests/test_helper.tcl; update Makefile or test runner scripts if needed
+
+## Evidence
+
+- Workflow: test-infrastructure-or-skip-tag-update
+- Example commits: 'Update or add skip tags in tests/unit/*.tcl or tests/integration/*.tcl'
+
