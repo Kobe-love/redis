@@ -1,41 +1,27 @@
 /*
- * Copyright (c) 2019, Redis Labs
+ * Copyright (c) 2019-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * Copyright (c) 2024-present, Valkey contributors.
+ * All rights reserved.
  *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
+#define REDISMODULE_CORE_MODULE /* A module that's part of the redis core, uses server.h too. */
 
 #include "server.h"
 #include "connhelpers.h"
 #include "adlist.h"
 
-#ifdef USE_OPENSSL
+#if (USE_OPENSSL == 1 /* BUILD_YES */ ) || ((USE_OPENSSL == 2 /* BUILD_MODULE */) && (BUILD_TLS_MODULE == 2))
 
 #include <openssl/conf.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/pem.h>
@@ -43,6 +29,7 @@
 #include <openssl/decoder.h>
 #endif
 #include <sys/uio.h>
+#include <arpa/inet.h>
 
 #define REDIS_TLS_PROTO_TLSv1       (1<<0)
 #define REDIS_TLS_PROTO_TLSv1_1     (1<<1)
@@ -56,7 +43,38 @@
 #define REDIS_TLS_PROTO_DEFAULT     (REDIS_TLS_PROTO_TLSv1_2)
 #endif
 
-extern ConnectionType CT_Socket;
+/* Peer certificate name verification (tls-expected-peer-name) relies on the
+ * X509_VERIFY_PARAM host API, available since OpenSSL 1.0.2. Defining
+ * TLS_NO_PEER_NAME_VERIFICATION compiles the feature out on any OpenSSL version;
+ * it is also the required opt-out for building against an older OpenSSL, since
+ * building there without it is a hard error (so a build cannot accidentally lack
+ * the check). When compiled out and the option is set, each affected connection
+ * warns and proceeds (CA validation still applies). */
+#if defined(TLS_NO_PEER_NAME_VERIFICATION)
+#define CONN_TLS_SUPPORTS_VERIFY_NAME 0
+#elif OPENSSL_VERSION_NUMBER >= 0x10002000L
+#define CONN_TLS_SUPPORTS_VERIFY_NAME 1
+#else
+#error "tls-expected-peer-name requires OpenSSL 1.0.2 or newer. Build against a \
+newer OpenSSL, or define TLS_NO_PEER_NAME_VERIFICATION to build without peer \
+certificate name verification."
+#endif
+
+/* TLS groups rely on SSL_CTX_set1_groups_list(), or on the
+ * older SSL_CTX_set1_curves_list() name. Build failure is intentional when the
+ * OpenSSL headers expose neither API, so Redis does not silently ignore this
+ * TLS policy option. Define TLS_NO_GROUPS to compile the feature out. */
+#if defined(TLS_NO_GROUPS)
+#define CONN_TLS_SUPPORTS_GROUPS 0
+#elif defined(SSL_CTX_set1_groups_list)
+#define CONN_TLS_SUPPORTS_GROUPS 1
+#define redisTlsCtxSetGroupsList(ctx, list) SSL_CTX_set1_groups_list((ctx), (list))
+#elif defined(SSL_CTX_set1_curves_list)
+#define CONN_TLS_SUPPORTS_GROUPS 1
+#define redisTlsCtxSetGroupsList(ctx, list) SSL_CTX_set1_curves_list((ctx), (list))
+#else
+#error "tls-groups requires OpenSSL with SSL_CTX_set1_groups_list or SSL_CTX_set1_curves_list. Define TLS_NO_GROUPS to build without TLS groups."
+#endif
 
 SSL_CTX *redis_tls_ctx = NULL;
 SSL_CTX *redis_tls_client_ctx = NULL;
@@ -95,10 +113,6 @@ static int parseProtocolsConfig(const char *str) {
 
     return protocols;
 }
-
-/* list of connections with pending data already read from the socket, but not
- * served to the reader yet. */
-static list *pending_list = NULL;
 
 /**
  * OpenSSL global initialization and locking handling callbacks.
@@ -141,7 +155,7 @@ static void initCryptoLocks(void) {
 }
 #endif /* USE_CRYPTO_LOCKS */
 
-void tlsInit(void) {
+static void tlsInit(void) {
     /* Enable configuring OpenSSL using the standard openssl.cnf
      * OPENSSL_config()/OPENSSL_init_crypto() should be the first 
      * call to the OpenSSL* library.
@@ -165,11 +179,9 @@ void tlsInit(void) {
     if (!RAND_poll()) {
         serverLog(LL_WARNING, "OpenSSL: Failed to seed random number generator.");
     }
-
-    pending_list = listCreate();
 }
 
-void tlsCleanup(void) {
+static void tlsCleanup(void) {
     if (redis_tls_ctx) {
         SSL_CTX_free(redis_tls_ctx);
         redis_tls_ctx = NULL;
@@ -211,6 +223,7 @@ static SSL_CTX *createSSLContext(redisTLSContextConfig *ctx_config, int protocol
     SSL_CTX *ctx = NULL;
 
     ctx = SSL_CTX_new(SSLv23_method());
+    if (!ctx) goto error;
 
     SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3);
 
@@ -272,6 +285,18 @@ static SSL_CTX *createSSLContext(redisTLSContextConfig *ctx_config, int protocol
     }
 #endif
 
+    if (ctx_config->groups) {
+#if CONN_TLS_SUPPORTS_GROUPS
+        if (!redisTlsCtxSetGroupsList(ctx, ctx_config->groups)) {
+            serverLog(LL_WARNING, "Failed to configure TLS groups: %s", ctx_config->groups);
+            goto error;
+        }
+#else
+        serverLog(LL_WARNING, "Failed to configure TLS groups: not supported by this build");
+        goto error;
+#endif
+    }
+
     return ctx;
 
 error:
@@ -281,11 +306,19 @@ error:
 
 /* Attempt to configure/reconfigure TLS. This operation is atomic and will
  * leave the SSL_CTX unchanged if fails.
+ * @priv: config of redisTLSContextConfig.
+ * @reconfigure: if true, ignore the previous configure; if false, only
+ *               configure from @ctx_config if redis_tls_ctx is NULL.
  */
-int tlsConfigure(redisTLSContextConfig *ctx_config) {
+static int tlsConfigure(void *priv, int reconfigure) {
+    redisTLSContextConfig *ctx_config = (redisTLSContextConfig *)priv;
     char errbuf[256];
     SSL_CTX *ctx = NULL;
     SSL_CTX *client_ctx = NULL;
+
+    if (!reconfigure && redis_tls_ctx) {
+        return C_OK;
+    }
 
     if (!ctx_config->cert_file) {
         serverLog(LL_WARNING, "No tls-cert-file configured!");
@@ -306,7 +339,7 @@ int tlsConfigure(redisTLSContextConfig *ctx_config) {
     int protocols = parseProtocolsConfig(ctx_config->protocols);
     if (protocols == -1) goto error;
 
-    /* Create server side/generla context */
+    /* Create server side/general context */
     ctx = createSSLContext(ctx_config, protocols, 0);
     if (!ctx) goto error;
 
@@ -406,12 +439,6 @@ error:
     return C_ERR;
 }
 
-/* Return 1 if TLS was already configured, 0 otherwise.
- */
-int isTlsConfigured(void) {
-    return redis_tls_ctx != NULL;
-}
-
 #ifdef TLS_DEBUGGING
 #define TLSCONN_DEBUG(fmt, ...) \
     serverLog(LL_DEBUG, "TLSCONN: " fmt, __VA_ARGS__)
@@ -419,7 +446,7 @@ int isTlsConfigured(void) {
 #define TLSCONN_DEBUG(fmt, ...)
 #endif
 
-ConnectionType CT_TLS;
+static ConnectionType CT_TLS;
 
 /* Normal socket connections have a simple events/handler correlation.
  *
@@ -453,19 +480,21 @@ typedef struct tls_connection {
     listNode *pending_list_node;
 } tls_connection;
 
-static connection *createTLSConnection(int client_side) {
+static connection *createTLSConnection(struct aeEventLoop *el, int client_side) {
     SSL_CTX *ctx = redis_tls_ctx;
     if (client_side && redis_tls_client_ctx)
         ctx = redis_tls_client_ctx;
     tls_connection *conn = zcalloc(sizeof(tls_connection));
     conn->c.type = &CT_TLS;
     conn->c.fd = -1;
+    conn->c.el = el;
+    conn->c.iovcnt = IOV_MAX;
     conn->ssl = SSL_new(ctx);
     return (connection *) conn;
 }
 
-connection *connCreateTLS(void) {
-    return createTLSConnection(1);
+static connection *connCreateTLS(struct aeEventLoop *el) {
+    return createTLSConnection(el, 1);
 }
 
 /* Fetch the latest OpenSSL error and store it in the connection */
@@ -485,9 +514,11 @@ static void updateTLSError(tls_connection *conn) {
  * Callers should use connGetState() and verify the created connection
  * is not in an error state.
  */
-connection *connCreateAcceptedTLS(int fd, int require_auth) {
-    tls_connection *conn = (tls_connection *) createTLSConnection(0);
+static connection *connCreateAcceptedTLS(struct aeEventLoop *el, int fd, void *priv) {
+    int require_auth = *(int *)priv;
+    tls_connection *conn = (tls_connection *) createTLSConnection(el, 0);
     conn->c.fd = fd;
+    conn->c.el = el;
     conn->c.state = CONN_STATE_ACCEPTING;
 
     if (!conn->ssl) {
@@ -515,6 +546,7 @@ connection *connCreateAcceptedTLS(int fd, int require_auth) {
 }
 
 static void tlsEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask);
+static void updateSSLEvent(tls_connection *conn);
 
 /* Process the return code received from OpenSSL>
  * Update the want parameter with expected I/O.
@@ -548,18 +580,59 @@ static int handleSSLReturnCode(tls_connection *conn, int ret_value, WantIOType *
     return 0;
 }
 
-void registerSSLEvent(tls_connection *conn, WantIOType want) {
-    int mask = aeGetFileEvents(server.el, conn->c.fd);
+/* Handle OpenSSL return code following SSL_write() or SSL_read():
+ *
+ * - Updates conn state and last_errno.
+ * - If update_event is nonzero, calls updateSSLEvent() when necessary.
+ *
+ * Returns ret_value, or -1 on error or dropped connection.
+ */
+static int updateStateAfterSSLIO(tls_connection *conn, int ret_value, int update_event) {
+    /* If system call was interrupted, there's no need to go through the full
+     * OpenSSL error handling and just report this for the caller to retry the
+     * operation.
+     */
+    if (errno == EINTR) {
+        conn->c.last_errno = EINTR;
+        return -1;
+    }
+
+    if (ret_value <= 0) {
+        WantIOType want = 0;
+        int ssl_err;
+        if (!(ssl_err = handleSSLReturnCode(conn, ret_value, &want))) {
+            if (want == WANT_READ) conn->flags |= TLS_CONN_FLAG_WRITE_WANT_READ;
+            if (want == WANT_WRITE) conn->flags |= TLS_CONN_FLAG_READ_WANT_WRITE;
+            if (update_event) updateSSLEvent(conn);
+            errno = EAGAIN;
+            return -1;
+        } else {
+            if (ssl_err == SSL_ERROR_ZERO_RETURN ||
+                ((ssl_err == SSL_ERROR_SYSCALL && !errno))) {
+                conn->c.state = CONN_STATE_CLOSED;
+                return -1;
+            } else {
+                conn->c.state = CONN_STATE_ERROR;
+                return -1;
+            }
+        }
+    }
+
+    return ret_value;
+}
+
+static void registerSSLEvent(tls_connection *conn, WantIOType want) {
+    int mask = aeGetFileEvents(conn->c.el, conn->c.fd);
 
     switch (want) {
         case WANT_READ:
-            if (mask & AE_WRITABLE) aeDeleteFileEvent(server.el, conn->c.fd, AE_WRITABLE);
-            if (!(mask & AE_READABLE)) aeCreateFileEvent(server.el, conn->c.fd, AE_READABLE,
+            if (mask & AE_WRITABLE) aeDeleteFileEvent(conn->c.el, conn->c.fd, AE_WRITABLE);
+            if (!(mask & AE_READABLE)) aeCreateFileEvent(conn->c.el, conn->c.fd, AE_READABLE,
                         tlsEventHandler, conn);
             break;
         case WANT_WRITE:
-            if (mask & AE_READABLE) aeDeleteFileEvent(server.el, conn->c.fd, AE_READABLE);
-            if (!(mask & AE_WRITABLE)) aeCreateFileEvent(server.el, conn->c.fd, AE_WRITABLE,
+            if (mask & AE_READABLE) aeDeleteFileEvent(conn->c.el, conn->c.fd, AE_READABLE);
+            if (!(mask & AE_WRITABLE)) aeCreateFileEvent(conn->c.el, conn->c.fd, AE_WRITABLE,
                         tlsEventHandler, conn);
             break;
         default:
@@ -568,34 +641,110 @@ void registerSSLEvent(tls_connection *conn, WantIOType want) {
     }
 }
 
-void updateSSLEvent(tls_connection *conn) {
-    int mask = aeGetFileEvents(server.el, conn->c.fd);
+static void updateSSLEvent(tls_connection *conn) {
+    serverAssert(conn->c.el);
+    int mask = aeGetFileEvents(conn->c.el, conn->c.fd);
     int need_read = conn->c.read_handler || (conn->flags & TLS_CONN_FLAG_WRITE_WANT_READ);
     int need_write = conn->c.write_handler || (conn->flags & TLS_CONN_FLAG_READ_WANT_WRITE);
 
     if (need_read && !(mask & AE_READABLE))
-        aeCreateFileEvent(server.el, conn->c.fd, AE_READABLE, tlsEventHandler, conn);
+        aeCreateFileEvent(conn->c.el, conn->c.fd, AE_READABLE, tlsEventHandler, conn);
     if (!need_read && (mask & AE_READABLE))
-        aeDeleteFileEvent(server.el, conn->c.fd, AE_READABLE);
+        aeDeleteFileEvent(conn->c.el, conn->c.fd, AE_READABLE);
 
     if (need_write && !(mask & AE_WRITABLE))
-        aeCreateFileEvent(server.el, conn->c.fd, AE_WRITABLE, tlsEventHandler, conn);
+        aeCreateFileEvent(conn->c.el, conn->c.fd, AE_WRITABLE, tlsEventHandler, conn);
     if (!need_write && (mask & AE_WRITABLE))
-        aeDeleteFileEvent(server.el, conn->c.fd, AE_WRITABLE);
+        aeDeleteFileEvent(conn->c.el, conn->c.fd, AE_WRITABLE);
+}
+
+/* Add a connection to the list of connections with pending data that has
+ * already been read from the socket but has not yet been served to the reader. */
+static void tlsPendingAdd(tls_connection *conn) {
+    if (!conn->c.el->privdata[1])
+        conn->c.el->privdata[1] = listCreate();
+
+    list *pending_list = conn->c.el->privdata[1];
+    if (!conn->pending_list_node) {
+        listAddNodeTail(pending_list, conn);
+        conn->pending_list_node = listLast(pending_list);
+    }
+}
+
+/* Removes a connection from the list of connections with pending data. */
+static void tlsPendingRemove(tls_connection *conn) {
+    if (conn->pending_list_node) {
+        list *pending_list = conn->c.el->privdata[1];
+        listDelNode(pending_list, conn->pending_list_node);
+        conn->pending_list_node = NULL;
+    }
+}
+
+/* Returns the requested certificate subject field as a newly allocated,
+ * binary-safe sds, or NULL on failure. */
+static sds getCertFieldByName(X509 *cert, const char *field) {
+    if (!cert || !field) return NULL;
+
+    int nid = -1;
+
+    if (!strcasecmp(field, "CN"))
+        nid = NID_commonName;
+    else if (!strcasecmp(field, "O"))
+        nid = NID_organizationName;
+    /* Add more mappings here as needed */
+
+    if (nid == -1) return NULL;
+
+    X509_NAME *subject = X509_get_subject_name(cert);
+    if (!subject) return NULL;
+
+    /* The name may contain embedded NULs, so use the returned length, not
+     * strlen, to build the proper binary-safe string. */
+    char buf[256];
+    int len = X509_NAME_get_text_by_NID(subject, nid, buf, sizeof(buf));
+    if (len <= 0) return NULL;
+
+    return sdstrynewlen(buf, len);
+}
+
+sds tlsGetPeerUsername(connection *conn_) {
+    tls_connection *conn = (tls_connection *)conn_;
+    if (!conn || !SSL_is_init_finished(conn->ssl)) return NULL;
+
+    /* Find the corresponding field name from the enum mapping */
+    const char *field = NULL;
+    switch (server.tls_ctx_config.client_auth_user) {
+    case TLS_CLIENT_FIELD_CN:
+        field = "CN";
+        break;
+    default:
+        return NULL;
+    }
+
+    if (!field) return NULL;
+
+    X509 *cert = SSL_get_peer_certificate(conn->ssl);
+    if (!cert) return NULL;
+
+    sds result = getCertFieldByName(cert, field);
+    if (!result)
+        serverLog(LL_NOTICE, "TLS: Failed to extract field '%s' from certificate", field);
+
+    X509_free(cert);
+    return result;
 }
 
 static void tlsHandleEvent(tls_connection *conn, int mask) {
     int ret, conn_error;
 
     TLSCONN_DEBUG("tlsEventHandler(): fd=%d, state=%d, mask=%d, r=%d, w=%d, flags=%d",
-            fd, conn->c.state, mask, conn->c.read_handler != NULL, conn->c.write_handler != NULL,
+            conn->c.fd, conn->c.state, mask, conn->c.read_handler != NULL, conn->c.write_handler != NULL,
             conn->flags);
-
-    ERR_clear_error();
 
     switch (conn->c.state) {
         case CONN_STATE_CONNECTING:
-            conn_error = connGetSocketError((connection *) conn);
+            ERR_clear_error();
+            conn_error = anetGetError(conn->c.fd);
             if (conn_error) {
                 conn->c.last_errno = conn_error;
                 conn->c.state = CONN_STATE_ERROR;
@@ -628,6 +777,7 @@ static void tlsHandleEvent(tls_connection *conn, int mask) {
             conn->c.conn_handler = NULL;
             break;
         case CONN_STATE_ACCEPTING:
+            ERR_clear_error();
             ret = SSL_accept(conn->ssl);
             if (ret <= 0) {
                 WantIOType want = 0;
@@ -692,13 +842,9 @@ static void tlsHandleEvent(tls_connection *conn, int mask) {
              * to a list of pending connection that should be handled anyway. */
             if ((mask & AE_READABLE)) {
                 if (SSL_pending(conn->ssl) > 0) {
-                    if (!conn->pending_list_node) {
-                        listAddNodeTail(pending_list, conn);
-                        conn->pending_list_node = listLast(pending_list);
-                    }
+                    tlsPendingAdd(conn);
                 } else if (conn->pending_list_node) {
-                    listDelNode(pending_list, conn->pending_list_node);
-                    conn->pending_list_node = NULL;
+                    tlsPendingRemove(conn);
                 }
             }
 
@@ -708,7 +854,8 @@ static void tlsHandleEvent(tls_connection *conn, int mask) {
             break;
     }
 
-    updateSSLEvent(conn);
+    /* The event loop may have been unbound during the event processing above. */
+    if (conn->c.el) updateSSLEvent(conn);
 }
 
 static void tlsEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask) {
@@ -718,10 +865,59 @@ static void tlsEventHandler(struct aeEventLoop *el, int fd, void *clientData, in
     tlsHandleEvent(conn, mask);
 }
 
+static void tlsAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    int cport, cfd;
+    int max = server.max_new_tls_conns_per_cycle;
+    char cip[NET_IP_STR_LEN];
+    UNUSED(mask);
+    UNUSED(privdata);
+
+    while(max--) {
+        cfd = anetTcpAccept(server.neterr, fd, cip, sizeof(cip), &cport);
+        if (cfd == ANET_ERR) {
+            if (anetAcceptFailureNeedsRetry(errno))
+                continue;
+            if (errno != EWOULDBLOCK)
+                serverLog(LL_WARNING,
+                    "Accepting client connection: %s", server.neterr);
+            return;
+        }
+        serverLog(LL_VERBOSE,"Accepted %s:%d", cip, cport);
+        acceptCommonHandler(connCreateAcceptedTLS(el,cfd,&server.tls_auth_clients), 0, cip);
+    }
+}
+
+static int connTLSAddr(connection *conn, char *ip, size_t ip_len, int *port, int remote) {
+    return anetFdToString(conn->fd, ip, ip_len, port, remote);
+}
+
+static int connTLSIsLocal(connection *conn) {
+    return connectionTypeTcp()->is_local(conn);
+}
+
+static int connTLSListen(connListener *listener) {
+    return listenToPort(listener);
+}
+
+static void connTLSShutdown(connection *conn_) {
+    tls_connection *conn = (tls_connection *) conn_;
+
+    if (conn->ssl) {
+        if (conn->c.state == CONN_STATE_CONNECTED)
+            SSL_shutdown(conn->ssl);
+        SSL_free(conn->ssl);
+        conn->ssl = NULL;
+    }
+
+    connectionTypeTcp()->shutdown(conn_);
+}
+
 static void connTLSClose(connection *conn_) {
     tls_connection *conn = (tls_connection *) conn_;
 
     if (conn->ssl) {
+        if (conn->c.state == CONN_STATE_CONNECTED)
+            SSL_shutdown(conn->ssl);
         SSL_free(conn->ssl);
         conn->ssl = NULL;
     }
@@ -732,11 +928,12 @@ static void connTLSClose(connection *conn_) {
     }
 
     if (conn->pending_list_node) {
+        list *pending_list = conn->c.el->privdata[1];
         listDelNode(pending_list, conn->pending_list_node);
         conn->pending_list_node = NULL;
     }
 
-    CT_Socket.close(conn_);
+    connectionTypeTcp()->close(conn_);
 }
 
 static int connTLSAccept(connection *_conn, ConnectionCallbackFunc accept_handler) {
@@ -768,14 +965,113 @@ static int connTLSAccept(connection *_conn, ConnectionCallbackFunc accept_handle
     return C_OK;
 }
 
+/* Configure the SSL object to verify the peer certificate's SAN/CN against the
+ * given space-separated list of expected name(s), in addition to CA chain
+ * validation. Used to bind server-to-server connections to a specific identity
+ * (tls-expected-peer-name) rather than trusting any CA-signed certificate. The
+ * name(s) come from local configuration, never from the wire. A subsequent
+ * handshake fails with X509_V_ERR_HOSTNAME_MISMATCH if no listed name matches.
+ * Returns C_OK on success, C_ERR if a name could not be applied or the value
+ * contained no usable name. On a TLS_NO_PEER_NAME_VERIFICATION build (OpenSSL
+ * < 1.0.2) it cannot enforce the name; it logs a warning and returns C_OK so the
+ * connection still proceeds (CA validation still applies). */
+static int tlsSetVerifyName(SSL *ssl, const char *names) {
+#if CONN_TLS_SUPPORTS_VERIFY_NAME
+    /* Use the X509_VERIFY_PARAM_* host API (available since OpenSSL 1.0.2) rather
+     * than the SSL_set1_host()/SSL_add1_host()/SSL_set_hostflags() convenience
+     * wrappers (introduced only in OpenSSL 1.1.0). This keeps certificate name
+     * verification available on every OpenSSL version that actually provides the
+     * hostname-checking machinery, matching the older versions the rest of this
+     * file still supports. */
+    X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+
+    /* Reject partial-label wildcards (e.g. "f*.example.com"); a full-label
+     * "*.example.com" still matches. */
+    X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+
+    int count = 0;
+    sds *tokens = sdssplitlen(names, strlen(names), " ", 1, &count);
+    if (!tokens) return C_ERR;
+
+    int first = 1, ok = 1;
+    for (int i = 0; i < count; i++) {
+        if (sdslen(tokens[i]) == 0) continue; /* skip empty tokens from runs of spaces */
+        /* First name via set1_host (replaces), each subsequent via add1_host
+         * (appends); a match against any listed name succeeds. */
+        int r = first ? X509_VERIFY_PARAM_set1_host(param, tokens[i], 0)
+                      : X509_VERIFY_PARAM_add1_host(param, tokens[i], 0);
+        first = 0;
+        if (r != 1) { ok = 0; break; }
+    }
+    sdsfreesplitres(tokens, count);
+
+    /* !ok: a name failed to apply. first still set: the value had no usable
+     * token (e.g. all whitespace). Either way, fail closed. */
+    return (ok && !first) ? C_OK : C_ERR;
+#else
+    /* This build was compiled with TLS_NO_PEER_NAME_VERIFICATION (either to opt
+     * out, or because it targets OpenSSL < 1.0.2, which lacks the X509_VERIFY_PARAM
+     * host API), so we cannot honor tls-expected-peer-name. Warn and let the
+     * connection proceed (CA chain validation still applies) rather than refusing it. */
+    UNUSED(ssl);
+    UNUSED(names);
+    serverLog(LL_WARNING,
+        "tls-expected-peer-name is set but peer certificate name verification is "
+        "disabled in this build (TLS_NO_PEER_NAME_VERIFICATION); the name is not "
+        "enforced on this connection.");
+    return C_OK;
+#endif
+}
+
+/* Set the expected peer name(s) to verify on an already-created SSL connection.
+ * Used on the accepting side (e.g. the cluster bus) to verify the connecting
+ * peer's client certificate. No-op when name is empty. */
+static int connTLSSetVerifyName(connection *conn_, const char *name) {
+    tls_connection *conn = (tls_connection *) conn_;
+    if (!conn->ssl || !name || !name[0]) return C_OK;
+    if (tlsSetVerifyName(conn->ssl, name) != C_OK) {
+        serverLog(LL_WARNING, "Failed to set expected TLS peer name on accepted connection");
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+/* Apply the configured tls-expected-peer-name (if any) to an outbound connection's
+ * SSL object before the handshake. Shared by the non-blocking (connTLSConnect) and
+ * blocking (connTLSBlockingConnect) connect paths so that every outbound
+ * server-to-server connection -- replication, cluster bus and MIGRATE -- is
+ * verified against the configured identity. Returns C_OK on success or when no
+ * name is configured; on failure sets the connection error state and returns
+ * C_ERR. */
+static int tlsApplyExpectedPeerName(tls_connection *conn, const char *addr) {
+    const char *name = server.tls_ctx_config.expected_peer_name;
+    if (!name || !name[0]) return C_OK;
+    if (tlsSetVerifyName(conn->ssl, name) != C_OK) {
+        serverLog(LL_WARNING, "Failed to set expected TLS peer name for outbound connection to %s", addr);
+        conn->c.state = CONN_STATE_ERROR;
+        return C_ERR;
+    }
+    return C_OK;
+}
+
 static int connTLSConnect(connection *conn_, const char *addr, int port, const char *src_addr, ConnectionCallbackFunc connect_handler) {
     tls_connection *conn = (tls_connection *) conn_;
+    unsigned char addr_buf[sizeof(struct in6_addr)];
 
     if (conn->c.state != CONN_STATE_NONE) return C_ERR;
     ERR_clear_error();
 
+    /* Check whether addr is an IP address, if not, use the value for Server Name Indication */
+    if (inet_pton(AF_INET, addr, addr_buf) != 1 && inet_pton(AF_INET6, addr, addr_buf) != 1) {
+        SSL_set_tlsext_host_name(conn->ssl, addr);
+    }
+
+    /* When tls-expected-peer-name is configured, verify the peer (server)
+     * certificate against the configured name(s) on this outbound connection. */
+    if (tlsApplyExpectedPeerName(conn, addr) != C_OK) return C_ERR;
+
     /* Initiate Socket connection first */
-    if (CT_Socket.connect(conn_, addr, port, src_addr, connect_handler) == C_ERR) return C_ERR;
+    if (connectionTypeTcp()->connect(conn_, addr, port, src_addr, connect_handler) == C_ERR) return C_ERR;
 
     /* Return now, once the socket is connected we'll initiate
      * TLS connection from the event handler.
@@ -783,41 +1079,41 @@ static int connTLSConnect(connection *conn_, const char *addr, int port, const c
     return C_OK;
 }
 
+static void connTLSUnbindEventLoop(connection *conn_) {
+    tls_connection *conn = (tls_connection *) conn_;
+
+    /* We need to remove all events from the old event loop. The subsequent
+     * updateSSLEvent() will add the appropriate events to the new event loop. */
+    if (conn->c.el) {
+        int mask = aeGetFileEvents(conn->c.el, conn->c.fd);
+        if (mask & AE_READABLE) aeDeleteFileEvent(conn->c.el, conn->c.fd, AE_READABLE);
+        if (mask & AE_WRITABLE) aeDeleteFileEvent(conn->c.el, conn->c.fd, AE_WRITABLE);
+
+        /* Check if there are pending events and handle accordingly. */
+        int has_pending = conn->pending_list_node != NULL;
+        if (has_pending) tlsPendingRemove(conn);
+    }
+}
+
+static int connTLSRebindEventLoop(connection *conn_, aeEventLoop *el) {
+    tls_connection *conn = (tls_connection *) conn_;
+    serverAssert(!conn->c.el && !conn->c.read_handler &&
+                 !conn->c.write_handler && !conn->pending_list_node);
+    conn->c.el = el;
+    if (el && SSL_pending(conn->ssl)) tlsPendingAdd(conn);
+    /* Add the appropriate events to the new event loop. */
+    updateSSLEvent((tls_connection *) conn);
+    return C_OK;
+}
+
 static int connTLSWrite(connection *conn_, const void *data, size_t data_len) {
     tls_connection *conn = (tls_connection *) conn_;
-    int ret, ssl_err;
+    int ret;
 
     if (conn->c.state != CONN_STATE_CONNECTED) return -1;
     ERR_clear_error();
     ret = SSL_write(conn->ssl, data, data_len);
-    /* If system call was interrupted, there's no need to go through the full
-     * OpenSSL error handling and just report this for the caller to retry the
-     * operation.
-     */
-    if (errno == EINTR) {
-        conn->c.last_errno = EINTR;
-        return -1;
-    }
-    if (ret <= 0) {
-        WantIOType want = 0;
-        if (!(ssl_err = handleSSLReturnCode(conn, ret, &want))) {
-            if (want == WANT_READ) conn->flags |= TLS_CONN_FLAG_WRITE_WANT_READ;
-            updateSSLEvent(conn);
-            errno = EAGAIN;
-            return -1;
-        } else {
-            if (ssl_err == SSL_ERROR_ZERO_RETURN ||
-                    ((ssl_err == SSL_ERROR_SYSCALL && !errno))) {
-                conn->c.state = CONN_STATE_CLOSED;
-                return -1;
-            } else {
-                conn->c.state = CONN_STATE_ERROR;
-                return -1;
-            }
-        }
-    }
-
-    return ret;
+    return updateStateAfterSSLIO(conn, ret, 1);
 }
 
 static int connTLSWritev(connection *conn_, const struct iovec *iov, int iovcnt) {
@@ -834,12 +1130,12 @@ static int connTLSWritev(connection *conn_, const struct iovec *iov, int iovcnt)
      * which is not worth doing so much memory copying to reduce system calls,
      * therefore, invoke connTLSWrite() multiple times to avoid memory copies. */
     if (iov_bytes_len > NET_MAX_WRITES_PER_EVENT) {
-        size_t tot_sent = 0;
+        ssize_t tot_sent = 0;
         for (int i = 0; i < iovcnt; i++) {
-            size_t sent = connTLSWrite(conn_, iov[i].iov_base, iov[i].iov_len);
+            ssize_t sent = connTLSWrite(conn_, iov[i].iov_base, iov[i].iov_len);
             if (sent <= 0) return tot_sent > 0 ? tot_sent : sent;
             tot_sent += sent;
-            if (sent != iov[i].iov_len) break;
+            if ((size_t) sent != iov[i].iov_len) break;
         }
         return tot_sent;
     }
@@ -860,40 +1156,11 @@ static int connTLSWritev(connection *conn_, const struct iovec *iov, int iovcnt)
 static int connTLSRead(connection *conn_, void *buf, size_t buf_len) {
     tls_connection *conn = (tls_connection *) conn_;
     int ret;
-    int ssl_err;
 
     if (conn->c.state != CONN_STATE_CONNECTED) return -1;
     ERR_clear_error();
     ret = SSL_read(conn->ssl, buf, buf_len);
-    /* If system call was interrupted, there's no need to go through the full
-     * OpenSSL error handling and just report this for the caller to retry the
-     * operation.
-     */
-    if (errno == EINTR) {
-        conn->c.last_errno = EINTR;
-        return -1;
-    }
-    if (ret <= 0) {
-        WantIOType want = 0;
-        if (!(ssl_err = handleSSLReturnCode(conn, ret, &want))) {
-            if (want == WANT_WRITE) conn->flags |= TLS_CONN_FLAG_READ_WANT_WRITE;
-            updateSSLEvent(conn);
-
-            errno = EAGAIN;
-            return -1;
-        } else {
-            if (ssl_err == SSL_ERROR_ZERO_RETURN ||
-                    ((ssl_err == SSL_ERROR_SYSCALL) && !errno)) {
-                conn->c.state = CONN_STATE_CLOSED;
-                return 0;
-            } else {
-                conn->c.state = CONN_STATE_ERROR;
-                return -1;
-            }
-        }
-    }
-
-    return ret;
+    return updateStateAfterSSLIO(conn, ret, 1);
 }
 
 static const char *connTLSGetLastError(connection *conn_) {
@@ -903,7 +1170,7 @@ static const char *connTLSGetLastError(connection *conn_) {
     return NULL;
 }
 
-int connTLSSetWriteHandler(connection *conn, ConnectionCallbackFunc func, int barrier) {
+static int connTLSSetWriteHandler(connection *conn, ConnectionCallbackFunc func, int barrier) {
     conn->write_handler = func;
     if (barrier)
         conn->flags |= CONN_FLAG_WRITE_BARRIER;
@@ -913,7 +1180,7 @@ int connTLSSetWriteHandler(connection *conn, ConnectionCallbackFunc func, int ba
     return C_OK;
 }
 
-int connTLSSetReadHandler(connection *conn, ConnectionCallbackFunc func) {
+static int connTLSSetReadHandler(connection *conn, ConnectionCallbackFunc func) {
     conn->read_handler = func;
     updateSSLEvent((tls_connection *) conn);
     return C_OK;
@@ -938,12 +1205,18 @@ static int connTLSBlockingConnect(connection *conn_, const char *addr, int port,
     if (conn->c.state != CONN_STATE_NONE) return C_ERR;
 
     /* Initiate socket blocking connect first */
-    if (CT_Socket.blocking_connect(conn_, addr, port, timeout) == C_ERR) return C_ERR;
+    if (connectionTypeTcp()->blocking_connect(conn_, addr, port, timeout) == C_ERR) return C_ERR;
+
+    /* When tls-expected-peer-name is configured, verify the peer (server)
+     * certificate against the configured name(s). This path is used by MIGRATE,
+     * so it must enforce the same identity check as connTLSConnect. */
+    if (tlsApplyExpectedPeerName(conn, addr) != C_OK) return C_ERR;
 
     /* Initiate TLS connection now.  We set up a send/recv timeout on the socket,
      * which means the specified timeout will not be enforced accurately. */
     SSL_set_fd(conn->ssl, conn->c.fd);
     setBlockingTimeout(conn, timeout);
+    ERR_clear_error();
 
     if ((ret = SSL_connect(conn->ssl)) <= 0) {
         conn->c.state = CONN_STATE_ERROR;
@@ -960,7 +1233,9 @@ static ssize_t connTLSSyncWrite(connection *conn_, char *ptr, ssize_t size, long
 
     setBlockingTimeout(conn, timeout);
     SSL_clear_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
+    ERR_clear_error();
     int ret = SSL_write(conn->ssl, ptr, size);
+    ret = updateStateAfterSSLIO(conn, ret, 0);
     SSL_set_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
     unsetBlockingTimeout(conn);
 
@@ -971,7 +1246,9 @@ static ssize_t connTLSSyncRead(connection *conn_, char *ptr, ssize_t size, long 
     tls_connection *conn = (tls_connection *) conn_;
 
     setBlockingTimeout(conn, timeout);
+    ERR_clear_error();
     int ret = SSL_read(conn->ssl, ptr, size);
+    ret = updateStateAfterSSLIO(conn, ret, 0);
     unsetBlockingTimeout(conn);
 
     return ret;
@@ -987,7 +1264,10 @@ static ssize_t connTLSSyncReadLine(connection *conn_, char *ptr, ssize_t size, l
     while(size) {
         char c;
 
-        if (SSL_read(conn->ssl,&c,1) <= 0) {
+        ERR_clear_error();
+        int ret = SSL_read(conn->ssl, &c, 1);
+        ret = updateStateAfterSSLIO(conn, ret, 0);
+        if (ret <= 0) {
             nread = -1;
             goto exit;
         }
@@ -1007,44 +1287,28 @@ exit:
     return nread;
 }
 
-static int connTLSGetType(connection *conn_) {
+static const char *connTLSGetType(connection *conn_) {
     (void) conn_;
 
     return CONN_TYPE_TLS;
 }
 
-ConnectionType CT_TLS = {
-    .ae_handler = tlsEventHandler,
-    .accept = connTLSAccept,
-    .connect = connTLSConnect,
-    .blocking_connect = connTLSBlockingConnect,
-    .read = connTLSRead,
-    .write = connTLSWrite,
-    .writev = connTLSWritev,
-    .close = connTLSClose,
-    .set_write_handler = connTLSSetWriteHandler,
-    .set_read_handler = connTLSSetReadHandler,
-    .get_last_error = connTLSGetLastError,
-    .sync_write = connTLSSyncWrite,
-    .sync_read = connTLSSyncRead,
-    .sync_readline = connTLSSyncReadLine,
-    .get_type = connTLSGetType
-};
-
-int tlsHasPendingData() {
+static int tlsHasPendingData(struct aeEventLoop *el) {
+    list *pending_list = el->privdata[1];
     if (!pending_list)
         return 0;
     return listLength(pending_list) > 0;
 }
 
-int tlsProcessPendingData() {
-    listIter li;
-    listNode *ln;
-
+static int tlsProcessPendingData(struct aeEventLoop *el) {
+    list *pending_list = el->privdata[1];
+    if (!pending_list) return 0;
     int processed = listLength(pending_list);
-    listRewind(pending_list,&li);
-    while((ln = listNext(&li))) {
+    for (int i = 0; i < processed; i++) {
+        listNode *ln = listFirst(pending_list);
+        if (!ln) break;
         tls_connection *conn = listNodeValue(ln);
+        tlsPendingRemove(conn);
         tlsHandleEvent(conn, AE_READABLE);
     }
     return processed;
@@ -1053,9 +1317,9 @@ int tlsProcessPendingData() {
 /* Fetch the peer certificate used for authentication on the specified
  * connection and return it as a PEM-encoded sds.
  */
-sds connTLSGetPeerCert(connection *conn_) {
+static sds connTLSGetPeerCert(connection *conn_) {
     tls_connection *conn = (tls_connection *) conn_;
-    if (conn_->type->get_type(conn_) != CONN_TYPE_TLS || !conn->ssl) return NULL;
+    if ((conn_->type != connectionTypeTls()) || !conn->ssl) return NULL;
 
     X509 *cert = SSL_get_peer_certificate(conn->ssl);
     if (!cert) return NULL;
@@ -1063,6 +1327,7 @@ sds connTLSGetPeerCert(connection *conn_) {
     BIO *bio = BIO_new(BIO_s_mem());
     if (bio == NULL || !PEM_write_bio_X509(bio, cert)) {
         if (bio != NULL) BIO_free(bio);
+        X509_free(cert);
         return NULL;
     }
 
@@ -1070,45 +1335,110 @@ sds connTLSGetPeerCert(connection *conn_) {
     long long bio_len = BIO_get_mem_data(bio, &bio_ptr);
     sds cert_pem = sdsnewlen(bio_ptr, bio_len);
     BIO_free(bio);
+    X509_free(cert);
 
     return cert_pem;
 }
 
+static ConnectionType CT_TLS = {
+    /* connection type */
+    .get_type = connTLSGetType,
+
+    /* connection type initialize & finalize & configure */
+    .init = tlsInit,
+    .cleanup = tlsCleanup,
+    .configure = tlsConfigure,
+
+    /* ae & accept & listen & error & address handler */
+    .ae_handler = tlsEventHandler,
+    .accept_handler = tlsAcceptHandler,
+    .addr = connTLSAddr,
+    .is_local = connTLSIsLocal,
+    .listen = connTLSListen,
+
+    /* create/shutdown/close connection */
+    .conn_create = connCreateTLS,
+    .conn_create_accepted = connCreateAcceptedTLS,
+    .shutdown = connTLSShutdown,
+    .close = connTLSClose,
+
+    /* connect & accept */
+    .connect = connTLSConnect,
+    .blocking_connect = connTLSBlockingConnect,
+    .accept = connTLSAccept,
+
+    /* event loop */
+    .unbind_event_loop = connTLSUnbindEventLoop,
+    .rebind_event_loop = connTLSRebindEventLoop,
+
+    /* IO */
+    .read = connTLSRead,
+    .write = connTLSWrite,
+    .writev = connTLSWritev,
+    .set_write_handler = connTLSSetWriteHandler,
+    .set_read_handler = connTLSSetReadHandler,
+    .get_last_error = connTLSGetLastError,
+    .sync_write = connTLSSyncWrite,
+    .sync_read = connTLSSyncRead,
+    .sync_readline = connTLSSyncReadLine,
+
+    /* pending data */
+    .has_pending_data = tlsHasPendingData,
+    .process_pending_data = tlsProcessPendingData,
+
+    /* TLS specified methods */
+    .get_peer_cert = connTLSGetPeerCert,
+    .get_peer_username = tlsGetPeerUsername,
+    .set_verify_name = connTLSSetVerifyName,
+};
+
+int RedisRegisterConnectionTypeTLS(void) {
+    return connTypeRegister(&CT_TLS);
+}
+
 #else   /* USE_OPENSSL */
 
-void tlsInit(void) {
+int RedisRegisterConnectionTypeTLS(void) {
+    serverLog(LL_VERBOSE, "Connection type %s not builtin", CONN_TYPE_TLS);
+    return C_ERR;
 }
 
-void tlsCleanup(void) {
+#endif
+
+#if BUILD_TLS_MODULE == 2 /* BUILD_MODULE */
+
+#include "release.h"
+
+int RedisModule_OnLoad(void *ctx, RedisModuleString **argv, int argc) {
+    UNUSED(argv);
+    UNUSED(argc);
+
+    /* Connection modules must be part of the same build as redis. */
+    if (strcmp(REDIS_BUILD_ID_RAW, redisBuildIdRaw())) {
+        serverLog(LL_NOTICE, "Connection type %s was not built together with the redis-server used.", CONN_TYPE_TLS);
+        return REDISMODULE_ERR;
+    }
+
+    if (RedisModule_Init(ctx,"tls",1,REDISMODULE_APIVER_1) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+
+    /* Connection modules is available only bootup. */
+    if ((RedisModule_GetContextFlags(ctx) & REDISMODULE_CTX_FLAGS_SERVER_STARTUP) == 0) {
+        serverLog(LL_NOTICE, "Connection type %s can be loaded only during bootup", CONN_TYPE_TLS);
+        return REDISMODULE_ERR;
+    }
+
+    RedisModule_SetModuleOptions(ctx, REDISMODULE_OPTIONS_HANDLE_REPL_ASYNC_LOAD);
+
+    if(connTypeRegister(&CT_TLS) != C_OK)
+        return REDISMODULE_ERR;
+
+    return REDISMODULE_OK;
 }
 
-int tlsConfigure(redisTLSContextConfig *ctx_config) {
-    UNUSED(ctx_config);
-    return C_OK;
+int RedisModule_OnUnload(void *arg) {
+    UNUSED(arg);
+    serverLog(LL_NOTICE, "Connection type %s can not be unloaded", CONN_TYPE_TLS);
+    return REDISMODULE_ERR;
 }
-
-connection *connCreateTLS(void) { 
-    return NULL;
-}
-
-connection *connCreateAcceptedTLS(int fd, int require_auth) {
-    UNUSED(fd);
-    UNUSED(require_auth);
-
-    return NULL;
-}
-
-int tlsHasPendingData() {
-    return 0;
-}
-
-int tlsProcessPendingData() {
-    return 0;
-}
-
-sds connTLSGetPeerCert(connection *conn_) {
-    (void) conn_;
-    return NULL;
-}
-
 #endif

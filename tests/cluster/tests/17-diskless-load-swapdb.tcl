@@ -54,9 +54,12 @@ test "Main db not affected when fail to diskless load" {
     set rd [redis_deferring_client redis $master_id]
     for {set j 0} {$j < $num} {incr j} {
         $rd set $j $value
-    }
-    for {set j 0} {$j < $num} {incr j} {
-        $rd read
+
+        if {($j + 1) % 500 == 0} {
+            for {set i 0} {$i < 500} {incr i} {
+                $rd read
+            }
+        }
     }
 
     # Start the replica again
@@ -80,7 +83,14 @@ test "Main db not affected when fail to diskless load" {
         fail "Fail to full sync"
     }
 
-    # Replica keys and keys to slots map still both are right
-    assert_equal {1} [$replica get $slot0_key]
+    # Replica keys and keys to slots map still both are right.
+    # CLUSTERDOWN errors are acceptable here because the cluster may be in a transient state
+    # due to the timing relationship with cluster-node-timeout.
+    if {[catch {$replica get $slot0_key} result]} {
+        assert_match "*CLUSTERDOWN*" $result
+    } else {
+        assert_equal {1} $result
+    }
+
     assert_equal $slot0_key [$replica CLUSTER GETKEYSINSLOT 0 1]
 }

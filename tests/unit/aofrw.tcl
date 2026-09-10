@@ -1,4 +1,6 @@
-start_server {tags {"aofrw external:skip"}} {
+# This unit has the potential to create huge .reqres files, causing log-req-res-validator.py to run for a very long time...
+# Since this unit doesn't do anything worth validating, reply_schema-wise, we decided to skip it
+start_server {tags {"aofrw external:skip logreqres:skip"} overrides {save {}}} {
     # Enable the AOF
     r config set appendonly yes
     r config set auto-aof-rewrite-percentage 0 ; # Disable auto-rewrite.
@@ -57,7 +59,7 @@ start_server {tags {"aofrw external:skip"}} {
     }
 }
 
-start_server {tags {"aofrw external:skip"} overrides {aof-use-rdb-preamble no}} {
+start_server {tags {"aofrw external:skip debug_defrag:skip"} overrides {aof-use-rdb-preamble no}} {
     test {Turning off AOF kills the background writing child if any} {
         r config set appendonly yes
         waitForBgrewriteaof r
@@ -78,10 +80,16 @@ start_server {tags {"aofrw external:skip"} overrides {aof-use-rdb-preamble no}} 
     }
 
     foreach d {string int} {
-        foreach e {quicklist} {
+        foreach e {listpack quicklist} {
             test "AOF rewrite of list with $e encoding, $d data" {
                 r flushall
-                set len 1000
+                if {$e eq {listpack}} {
+                    r config set list-max-listpack-size -2
+                    set len 10
+                } else {
+                    r config set list-max-listpack-size 10
+                    set len 1000
+                }
                 for {set j 0} {$j < $len} {incr j} {
                     if {$d eq {string}} {
                         set data [randstring 0 16 alpha]
@@ -195,6 +203,70 @@ start_server {tags {"aofrw external:skip"} overrides {aof-use-rdb-preamble no}} 
         assert_equal [r fcall test 0] 1
         r FUNCTION LIST
     } {{library_name test engine LUA functions {{name test description {} flags {}}}}}
+
+    # Array AOF rewrite tests
+    test "AOF rewrite of array with mixed value types" {
+        r flushall
+        # Create array with various value types
+        r arset myarray 0 12345           ;# int
+        r arset myarray 1 "hello"         ;# small string
+        r arset myarray 2 3.14159         ;# float
+        r arset myarray 100 [string repeat x 50]  ;# large string
+        r arset myarray 10000 "sparse"    ;# sparse index
+        set d1 [debug_digest]
+        r bgrewriteaof
+        waitForBgrewriteaof r
+        r debug loadaof
+        set d2 [debug_digest]
+        if {$d1 ne $d2} {
+            error "assertion:$d1 is not equal to $d2"
+        }
+    }
+
+    test "AOF rewrite of array with insert_idx (circular buffer)" {
+        r flushall
+        # Create circular buffer using ARRING
+        for {set i 0} {$i < 25} {incr i} {
+            r arring myarray 10 "v$i"
+        }
+        # insert_idx should be 4 ((25-1) % 10 = 4)
+        set next_before [r arnext myarray]
+        set d1 [debug_digest]
+
+        r bgrewriteaof
+        waitForBgrewriteaof r
+        r debug loadaof
+
+        set d2 [debug_digest]
+        if {$d1 ne $d2} {
+            error "assertion:$d1 is not equal to $d2"
+        }
+        # Verify insert_idx preserved
+        assert_equal $next_before [r arnext myarray]
+
+        # Continue inserting - should continue from correct position
+        set new_idx [r arring myarray 10 "after_aof"]
+        assert_equal $next_before $new_idx
+    }
+
+    test "AOF rewrite of array spanning multiple slices" {
+        r flushall
+        # Create array across multiple slices (slice_size = 4096)
+        for {set slice 0} {$slice < 5} {incr slice} {
+            set base [expr {$slice * 4096}]
+            for {set i 0} {$i < 20} {incr i} {
+                r arset myarray [expr {$base + $i * 100}] "s${slice}_v$i"
+            }
+        }
+        set d1 [debug_digest]
+        r bgrewriteaof
+        waitForBgrewriteaof r
+        r debug loadaof
+        set d2 [debug_digest]
+        if {$d1 ne $d2} {
+            error "assertion:$d1 is not equal to $d2"
+        }
+    }
 
     test {BGREWRITEAOF is delayed if BGSAVE is in progress} {
         r flushall

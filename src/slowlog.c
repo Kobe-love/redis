@@ -10,32 +10,12 @@
  *
  * ----------------------------------------------------------------------------
  *
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 
@@ -49,12 +29,13 @@ slowlogEntry *slowlogCreateEntry(client *c, robj **argv, int argc, long long dur
     slowlogEntry *se = zmalloc(sizeof(*se));
     int j, slargc = argc;
 
-    if (slargc > SLOWLOG_ENTRY_MAX_ARGC) slargc = SLOWLOG_ENTRY_MAX_ARGC;
+    if (slargc > server.slowlog_max_argc) slargc = server.slowlog_max_argc;
     se->argc = slargc;
+    se->cmd_argc = argc;
     se->argv = zmalloc(sizeof(robj*)*slargc);
     for (j = 0; j < slargc; j++) {
         /* Logging too many arguments is a useless memory waste, so we stop
-         * at SLOWLOG_ENTRY_MAX_ARGC, but use the last argument to specify
+         * at server.slowlog_max_argc, but use the last argument to specify
          * how many remaining arguments there were in the original command. */
         if (slargc != argc && j == slargc-1) {
             se->argv[j] = createObject(OBJ_STRING,
@@ -64,13 +45,13 @@ slowlogEntry *slowlogCreateEntry(client *c, robj **argv, int argc, long long dur
             /* Trim too long strings as well... */
             if (argv[j]->type == OBJ_STRING &&
                 sdsEncodedObject(argv[j]) &&
-                sdslen(argv[j]->ptr) > SLOWLOG_ENTRY_MAX_STRING)
+                sdslen(argv[j]->ptr) > server.slowlog_max_string_len)
             {
-                sds s = sdsnewlen(argv[j]->ptr, SLOWLOG_ENTRY_MAX_STRING);
+                sds s = sdsnewlen(argv[j]->ptr, server.slowlog_max_string_len);
 
                 s = sdscatprintf(s,"... (%lu more bytes)",
                     (unsigned long)
-                    sdslen(argv[j]->ptr) - SLOWLOG_ENTRY_MAX_STRING);
+                    sdslen(argv[j]->ptr) - server.slowlog_max_string_len);
                 se->argv[j] = createObject(OBJ_STRING,s);
             } else if (argv[j]->refcount == OBJ_SHARED_REFCOUNT) {
                 se->argv[j] = argv[j];
@@ -119,16 +100,20 @@ void slowlogInit(void) {
 
 /* Push a new entry into the slow log.
  * This function will make sure to trim the slow log accordingly to the
- * configured max length. */
-void slowlogPushEntryIfNeeded(client *c, robj **argv, int argc, long long duration) {
-    if (server.slowlog_log_slower_than < 0) return; /* Slowlog disabled */
-    if (duration >= server.slowlog_log_slower_than)
+ * configured max length.
+ * Returns 1 if an entry was added, 0 otherwise. */
+int slowlogPushEntryIfNeeded(client *c, robj **argv, int argc, long long duration) {
+    if (server.slowlog_log_slower_than < 0 || server.slowlog_max_len == 0) return 0;
+    if (duration >= server.slowlog_log_slower_than) {
         listAddNodeHead(server.slowlog,
                         slowlogCreateEntry(c,argv,argc,duration));
 
-    /* Remove old entries if needed. */
-    while (listLength(server.slowlog) > server.slowlog_max_len)
-        listDelNode(server.slowlog,listLast(server.slowlog));
+        /* Remove old entries if needed. */
+        while (listLength(server.slowlog) > server.slowlog_max_len)
+            listDelNode(server.slowlog,listLast(server.slowlog));
+        return 1;
+    }
+    return 0;
 }
 
 /* Remove all the entries from the current slow log. */
@@ -162,9 +147,8 @@ NULL
     } else if ((c->argc == 2 || c->argc == 3) &&
                !strcasecmp(c->argv[1]->ptr,"get"))
     {
-        long count = 10, sent = 0;
+        long count = 10;
         listIter li;
-        void *totentries;
         listNode *ln;
         slowlogEntry *se;
 
@@ -181,13 +165,17 @@ NULL
             }
         }
 
-        listRewind(server.slowlog,&li);
-        totentries = addReplyDeferredLen(c);
-        while(count-- && (ln = listNext(&li))) {
+        if (count > (long)listLength(server.slowlog)) {
+            count = listLength(server.slowlog);
+        }
+        addReplyArrayLen(c, count);
+        listRewind(server.slowlog, &li);
+        while (count--) {
             int j;
 
+            ln = listNext(&li);
             se = ln->value;
-            addReplyArrayLen(c,6);
+            addReplyArrayLen(c,7);
             addReplyLongLong(c,se->id);
             addReplyLongLong(c,se->time);
             addReplyLongLong(c,se->duration);
@@ -196,9 +184,8 @@ NULL
                 addReplyBulk(c,se->argv[j]);
             addReplyBulkCBuffer(c,se->peerid,sdslen(se->peerid));
             addReplyBulkCBuffer(c,se->cname,sdslen(se->cname));
-            sent++;
+            addReplyLongLong(c,se->cmd_argc);
         }
-        setDeferredArrayLen(c,totentries,sent);
     } else {
         addReplySubcommandSyntaxError(c);
     }

@@ -1,3 +1,17 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
 start_server {tags {"pause network"}} {
     test "Test read commands are not blocked by client pause" {
         r client PAUSE 100000 WRITE
@@ -7,6 +21,48 @@ start_server {tags {"pause network"}} {
         $rd INFO
         assert_equal [s 0 blocked_clients] 0
         r client unpause
+        $rd close
+    }
+
+    test "Test old pause-all takes precedence over new pause-write (less restrictive)" {
+        # Scenario:
+        # 1. Run 'PAUSE ALL' for 200msec
+        # 2. Run 'PAUSE WRITE' for 10 msec
+        # 3. Wait 50msec
+        # 4. 'GET FOO'.
+        # Expected that:
+        # - While the time of the second 'PAUSE' is shorter than first 'PAUSE',
+        #   pause-client feature will stick to the longer one, i.e, will be paused
+        #   up to 200msec.
+        # - The GET command will be postponed ~200msec, even though last command
+        #   paused only WRITE. This is because the first 'PAUSE ALL' command is
+        #   more restrictive than the second 'PAUSE WRITE' and pause-client feature
+        #   preserve most restrictive configuration among multiple settings.
+        set rd [redis_deferring_client]
+        $rd SET FOO BAR
+        $rd read
+
+        set test_start_time [clock milliseconds]
+        r client PAUSE 200 ALL
+        r client PAUSE 20 WRITE
+        after 50
+        $rd get FOO
+        $rd read
+        set elapsed [expr {[clock milliseconds]-$test_start_time}]
+        assert_lessthan 200 $elapsed
+        $rd close
+    }
+
+    test "Test new pause time is smaller than old one, then old time preserved" {
+        r client PAUSE 60000 WRITE
+        r client PAUSE 10 WRITE
+        after 100
+        set rd [redis_deferring_client]
+        $rd SET FOO BAR
+        wait_for_blocked_clients_count 1 100 10
+
+        r client unpause
+        assert_match "OK" [$rd read]
         $rd close
     }
 
@@ -44,24 +100,20 @@ start_server {tags {"pause network"}} {
         $rd2 close
     }
 
-    test "Test read/admin mutli-execs are not blocked by pause RO" {
+    test "Test read/admin multi-execs are not blocked by pause RO" {
         r SET FOO BAR
         r client PAUSE 100000 WRITE
-        set rd [redis_deferring_client]
-        $rd MULTI
-        assert_equal [$rd read] "OK"
-        $rd PING
-        assert_equal [$rd read] "QUEUED"
-        $rd GET FOO
-        assert_equal [$rd read] "QUEUED"
-        $rd EXEC
+        set rr [redis_client]
+        assert_equal [$rr MULTI] "OK"
+        assert_equal [$rr PING] "QUEUED"
+        assert_equal [$rr GET FOO] "QUEUED"
+        assert_match "PONG BAR" [$rr EXEC]
         assert_equal [s 0 blocked_clients] 0
         r client unpause 
-        assert_match "PONG BAR" [$rd read]
-        $rd close
+        $rr close
     }
 
-    test "Test write mutli-execs are blocked by pause RO" {
+    test "Test write multi-execs are blocked by pause RO" {
         set rd [redis_deferring_client]
         $rd MULTI
         assert_equal [$rd read] "OK"
@@ -78,20 +130,129 @@ start_server {tags {"pause network"}} {
     test "Test scripts are blocked by pause RO" {
         r client PAUSE 60000 WRITE
         set rd [redis_deferring_client]
+        set rd2 [redis_deferring_client]
         $rd EVAL "return 1" 0
 
-        wait_for_blocked_clients_count 1 50 100
+        # test a script with a shebang and no flags for coverage
+        $rd2 EVAL {#!lua
+            return 1
+        } 0
+
+        wait_for_blocked_clients_count 2 50 100
         r client unpause 
         assert_match "1" [$rd read]
+        assert_match "1" [$rd2 read]
         $rd close
+        $rd2 close
     }
 
-    test "Test may-replicate commands are rejected in ro script by pause RO" {
+    test "Test RO scripts are not blocked by pause RO" {
+        r set x y
+        # create a function for later
+        r FUNCTION load replace {#!lua name=f1
+            redis.register_function{
+                function_name='f1',
+                callback=function() return "hello" end,
+                flags={'no-writes'}
+            }
+        }
+
+        r client PAUSE 6000000 WRITE
+        set rr [redis_client]
+
+        # test an eval that's for sure not in the script cache
+        assert_equal [$rr EVAL {#!lua flags=no-writes
+                return 'unique script'
+            } 0
+        ] "unique script"
+
+        # for sanity, repeat that EVAL on a script that's already cached
+        assert_equal [$rr EVAL {#!lua flags=no-writes
+                return 'unique script'
+            } 0
+        ] "unique script"
+
+        # test EVAL_RO on a unique script that's for sure not in the cache
+        assert_equal [$rr EVAL_RO {
+            return redis.call('GeT', 'x')..' unique script'
+            } 1 x
+        ] "y unique script"
+
+        # test with evalsha
+        set sha [$rr script load {#!lua flags=no-writes
+                return 2
+            }]
+        assert_equal [$rr EVALSHA $sha 0] 2
+
+        # test with function
+        assert_equal [$rr fcall f1 0] hello
+
+        r client unpause
+        $rr close
+    }
+
+    test "Test read-only scripts in multi-exec are not blocked by pause RO" {
+        r SET FOO BAR
+        r client PAUSE 100000 WRITE
+        set rr [redis_client]
+        assert_equal [$rr MULTI] "OK"
+        assert_equal [$rr EVAL {#!lua flags=no-writes
+                return 12
+            } 0
+        ] QUEUED
+        assert_equal [$rr EVAL {#!lua flags=no-writes
+                return 13
+            } 0
+        ] QUEUED
+        assert_match "12 13" [$rr EXEC]
+        assert_equal [s 0 blocked_clients] 0
+        r client unpause
+        $rr close
+    }
+
+    test "Test write scripts in multi-exec are blocked by pause RO" {
+        set rd [redis_deferring_client]
+        set rd2 [redis_deferring_client]
+
+        # one with a shebang
+        $rd MULTI
+        assert_equal [$rd read] "OK"
+        $rd EVAL {#!lua
+                return 12
+            } 0
+        assert_equal [$rd read] "QUEUED"
+
+        # one without a shebang
+        $rd2 MULTI
+        assert_equal [$rd2 read] "OK"
+        $rd2 EVAL {#!lua
+                return 13
+            } 0
+        assert_equal [$rd2 read] "QUEUED"
+
         r client PAUSE 60000 WRITE
-        assert_error {ERR May-replicate commands are not allowed when client pause write*} {
+        $rd EXEC
+        $rd2 EXEC
+        wait_for_blocked_clients_count 2 50 100
+        r client unpause
+        assert_match "12" [$rd read]
+        assert_match "13" [$rd2 read]
+        $rd close
+        $rd2 close
+    }
+
+    test "Test may-replicate commands are rejected in RO scripts" {
+        # that's specifically important for CLIENT PAUSE WRITE
+        assert_error {ERR Write commands are not allowed from read-only scripts. script:*} {
             r EVAL_RO "return redis.call('publish','ch','msg')" 0
         }
-        r client unpause
+        assert_error {ERR Write commands are not allowed from read-only scripts. script:*} {
+            r EVAL {#!lua flags=no-writes
+                return redis.call('publish','ch','msg')
+            } 0
+        }
+        # make sure that publish isn't blocked from a non-RO script
+        assert_equal [r EVAL "return redis.call('publish','ch','msg')" 0] 0
     }
 
     test "Test multiple clients can be queued up and unblocked" {
@@ -213,6 +374,56 @@ start_server {tags {"pause network"}} {
             }
             r get foo2
         } {bar2}
+    }
+
+    test "Test the randomkey command will not cause the server to get into an infinite loop during the client pause write" {
+        r flushall
+
+        r multi
+        r set key value px 3
+        r client pause 10000 write
+        r exec
+        
+        after 5
+
+        wait_for_condition 50 100 {
+            [r randomkey] == "key"
+        } else {
+            fail "execute randomkey failed, caused by the infinite loop"
+        }
+
+        r client unpause
+        assert_equal [r randomkey] {}
+    }
+
+    test "CLIENT UNBLOCK is not allow to unblock client blocked by CLIENT PAUSE" {
+        set rd1 [redis_deferring_client]
+        set rd2 [redis_deferring_client]
+        $rd1 client id
+        $rd2 client id
+        set client_id1 [$rd1 read]
+        set client_id2 [$rd2 read]
+
+        r del mylist
+        r client pause 100000 write
+        $rd1 blpop mylist 0
+        $rd2 blpop mylist 0
+        wait_for_blocked_clients_count 2 50 100
+
+        # This used to trigger a panic.
+        assert_equal 0 [r client unblock $client_id1 timeout]
+        # This used to return a UNBLOCKED error.
+        assert_equal 0 [r client unblock $client_id2 error]
+
+        # After the unpause, it must be able to unblock the client.
+        r client unpause
+        assert_equal 1 [r client unblock $client_id1 timeout]
+        assert_equal 1 [r client unblock $client_id2 error]
+        assert_equal {} [$rd1 read]
+        assert_error "UNBLOCKED*" {$rd2 read}
+
+        $rd1 close
+        $rd2 close
     }
 
     # Make sure we unpause at the end

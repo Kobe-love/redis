@@ -1,35 +1,17 @@
 /* CLI (command line interface) common methods
  * 
- * Copyright (c) 2020, Redis Labs
+ * Copyright (c) 2020-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "fmacros.h"
 #include "cli_common.h"
+#include "version.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -47,6 +29,9 @@
 #endif
 
 #define UNUSED(V) ((void) V)
+
+char *redisGitSHA1(void);
+char *redisGitDirty(void);
 
 /* Wrapper around redisSecureConnection to avoid hiredis_ssl dependencies if
  * not building with TLS support.
@@ -93,6 +78,14 @@ int cliSecureConnection(redisContext *c, cliSSLconfig config, const char **err) 
         if (config.ciphersuites && !SSL_CTX_set_ciphersuites(ssl_ctx, config.ciphersuites)) {
             *err = "Error while setting cypher suites";
             goto error;
+        }
+#endif
+#if CLI_TLS_SUPPORTS_GROUPS
+        if (config.groups) {
+            if (!cliSslCtxSetGroupsList(ssl_ctx, config.groups)) {
+                *err = "Error while configuring TLS groups";
+                goto error;
+            }
         }
 #endif
     }
@@ -191,7 +184,7 @@ ssize_t cliWriteConn(redisContext *c, const char *buf, size_t buf_len)
 
 /* Wrapper around OpenSSL (libssl and libcrypto) initialisation
  */
-int cliSecureInit()
+int cliSecureInit(void)
 {
 #ifdef USE_OPENSSL
     ERR_load_crypto_strings();
@@ -339,11 +332,18 @@ void parseRedisUri(const char *uri, const char* tool_name, cliConnInfo *connInfo
     /* Extract user info. */
     if ((userinfo = strchr(curr,'@'))) {
         if ((username = strchr(curr, ':')) && username < userinfo) {
-            connInfo->user = percentDecode(curr, username - curr);
+            /* Free any value previously set via --user / -a (later
+             * parameters override earlier ones) and use NULL for an
+             * explicitly empty component, so cliAuth() falls back to the
+             * legacy single-argument AUTH (empty username) or skips AUTH
+             * entirely (empty password) instead of sending an empty ACL
+             * component, which the server rejects. */
+            sdsfree(connInfo->user);
+            connInfo->user = (username > curr) ? percentDecode(curr, username - curr) : NULL;
             curr = username + 1;
         }
-
-        connInfo->auth = percentDecode(curr, userinfo - curr);
+        sdsfree(connInfo->auth);
+        connInfo->auth = (userinfo > curr) ? percentDecode(curr, userinfo - curr) : NULL;
         curr = userinfo + 1;
     }
     if (curr == end) return;
@@ -352,9 +352,19 @@ void parseRedisUri(const char *uri, const char* tool_name, cliConnInfo *connInfo
     path = strchr(curr, '/');
     if (*curr != '/') {
         host = path ? path - 1 : end;
-        if ((port = strchr(curr, ':'))) {
-            connInfo->hostport = atoi(port + 1);
-            host = port - 1;
+        if (*curr == '[') {
+            curr += 1;
+            if ((port = strchr(curr, ']'))) {
+                if (*(port+1) == ':') {
+                    connInfo->hostport = atoi(port + 2);
+                }
+                host = port - 1;
+            }
+        } else {
+            if ((port = strchr(curr, ':'))) {
+                connInfo->hostport = atoi(port + 1);
+                host = port - 1;
+            }
         }
         sdsfree(connInfo->hostip);
         connInfo->hostip = sdsnewlen(curr, host - curr + 1);
@@ -390,9 +400,40 @@ sds escapeJsonString(sds s, const char *p, size_t len) {
         case '\t': s = sdscatlen(s,"\\t",2); break;
         case '\b': s = sdscatlen(s,"\\b",2); break;
         default:
-            s = sdscatprintf(s,(*p >= 0 && *p <= 0x1f) ? "\\u%04x" : "%c",*p);
+            s = sdscatprintf(s,*(unsigned char *)p <= 0x1f ? "\\u%04x" : "%c",*p);
         }
         p++;
     }
     return sdscatlen(s,"\"",1);
+}
+
+sds cliVersion(void) {
+    sds version = sdscatprintf(sdsempty(), "%s", REDIS_VERSION);
+
+    /* Add git commit and working tree status when available. */
+    if (strtoll(redisGitSHA1(),NULL,16)) {
+        version = sdscatprintf(version, " (git:%s", redisGitSHA1());
+        if (strtoll(redisGitDirty(),NULL,10))
+            version = sdscatprintf(version, "-dirty");
+        version = sdscat(version, ")");
+    }
+    return version;
+}
+
+/* This is a wrapper to call redisConnect or redisConnectWithTimeout. */
+redisContext *redisConnectWrapper(const char *ip, int port, const struct timeval tv) {
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+        return redisConnect(ip, port);
+    } else {
+        return redisConnectWithTimeout(ip, port, tv);
+    }
+}
+
+/* This is a wrapper to call redisConnectUnix or redisConnectUnixWithTimeout. */
+redisContext *redisConnectUnixWrapper(const char *path, const struct timeval tv) {
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+        return redisConnectUnix(path);
+    } else {
+        return redisConnectUnixWithTimeout(path, tv);
+    }
 }

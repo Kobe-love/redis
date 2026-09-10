@@ -4,6 +4,22 @@
 #include <hiredis.h>
 #include <sdscompat.h> /* Use hiredis' sds compat header that maps sds calls to their hi_ variants */
 
+#ifdef USE_OPENSSL
+#include <openssl/ssl.h>
+#endif
+
+#if defined(TLS_NO_GROUPS)
+#define CLI_TLS_SUPPORTS_GROUPS 0
+#elif defined(SSL_CTX_set1_groups_list)
+#define CLI_TLS_SUPPORTS_GROUPS 1
+#define cliSslCtxSetGroupsList(ctx, list) SSL_CTX_set1_groups_list((ctx), (list))
+#elif defined(SSL_CTX_set1_curves_list)
+#define CLI_TLS_SUPPORTS_GROUPS 1
+#define cliSslCtxSetGroupsList(ctx, list) SSL_CTX_set1_curves_list((ctx), (list))
+#else
+#define CLI_TLS_SUPPORTS_GROUPS 0
+#endif
+
 typedef struct cliSSLconfig {
     /* Requested SNI, or NULL */
     char *sni;
@@ -21,6 +37,8 @@ typedef struct cliSSLconfig {
     char* ciphers;
     /* Preferred ciphersuites list, or NULL (applies only to TLSv1.3) */
     char* ciphersuites;
+    /* Preferred TLS named groups list, or NULL */
+    char* groups;
 } cliSSLconfig;
 
 
@@ -37,7 +55,7 @@ int cliSecureConnection(redisContext *c, cliSSLconfig config, const char **err);
 
 ssize_t cliWriteConn(redisContext *c, const char *buf, size_t buf_len);
 
-int cliSecureInit();
+int cliSecureInit(void);
 
 sds readArgFromStdin(void);
 
@@ -50,5 +68,10 @@ void parseRedisUri(const char *uri, const char* tool_name, cliConnInfo *connInfo
 void freeCliConnInfo(cliConnInfo connInfo);
 
 sds escapeJsonString(sds s, const char *p, size_t len);
+
+sds cliVersion(void);
+
+redisContext *redisConnectWrapper(const char *ip, int port, const struct timeval tv);
+redisContext *redisConnectUnixWrapper(const char *path, const struct timeval tv);
 
 #endif /* __CLICOMMON_H */

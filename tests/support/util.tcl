@@ -1,3 +1,17 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
 proc randstring {min max {type binary}} {
     set len [expr {$min+int(rand()*($max-$min+1))}]
     set output {}
@@ -56,14 +70,19 @@ proc sanitizer_errors_from_file {filename} {
     set lines [split [exec cat $filename] "\n"]
 
     foreach line $lines {
-        # Ignore huge allocation warnings
+        # Ignore huge allocation warnings for both ASan and MSan
         if ([string match {*WARNING: AddressSanitizer failed to allocate*} $line]) {
             continue
         }
 
+        if ([string match {*WARNING: MemorySanitizer failed to allocate*} $line]) {
+            continue
+        }
+
         # GCC UBSAN output does not contain 'Sanitizer' but 'runtime error'.
-        if {[string match {*runtime error*} $log] ||
-            [string match {*Sanitizer*} $log]} {
+        if {[string match {*runtime error*} $line] ||
+            [string match {*Sanitizer*} $line] ||
+            [string match {*<jemalloc>:*size mismatch*} $line]} {
             return $log
         }
     }
@@ -72,8 +91,8 @@ proc sanitizer_errors_from_file {filename} {
 }
 
 proc getInfoProperty {infostr property} {
-    if {[regexp "\r\n$property:(.*?)\r\n" $infostr _ value]} {
-        set _ $value
+    if {[regexp -lineanchor "^$property:(.*?)\r\n" $infostr _ value]} {
+        return $value
     }
 }
 
@@ -111,23 +130,52 @@ proc waitForBgrewriteaof r {
 }
 
 proc wait_for_sync r {
-    wait_for_condition 50 100 {
+    set maxtries 50
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {$::tsan} {
+        set maxtries 100
+    }
+    # same for compression
+    if {$::compression} {
+        set maxtries 200
+    }
+
+    wait_for_condition $maxtries 100 {
         [status $r master_link_status] eq "up"
     } else {
         fail "replica didn't sync in time"
     }
 }
 
-proc wait_replica_online r {
-    wait_for_condition 50 100 {
-        [string match "*slave0:*,state=online*" [$r info replication]]
+proc wait_replica_online {r {replica_id 0} {maxtries 50} {delay 100}} {
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {$::tsan} {
+        set maxtries [expr {$maxtries * 2}]
+    }
+    if {$::compression} {
+        set maxtries [expr {$maxtries * 3}]
+    }
+
+    wait_for_condition $maxtries $delay {
+        [string match "*slave$replica_id:*,state=online*" [$r info replication]]
     } else {
-        fail "replica didn't online in time"
+        fail "replica $replica_id did not become online in time"
     }
 }
 
 proc wait_for_ofs_sync {r1 r2} {
-    wait_for_condition 50 100 {
+    set maxtries 50
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {$::tsan} {
+        set maxtries 100
+    }
+    if {$::compression} {
+        set maxtries 150
+    }
+    wait_for_condition $maxtries 100 {
         [status $r1 master_repl_offset] eq [status $r2 master_repl_offset]
     } else {
         fail "replica offset didn't match in time"
@@ -158,7 +206,7 @@ proc count_log_lines {srv_idx} {
 # returns the number of times a line with that pattern appears in a file
 proc count_message_lines {file pattern} {
     set res 0
-    # exec fails when grep exists with status other than 0 (when the patter wasn't found)
+    # exec fails when grep exists with status other than 0 (when the pattern wasn't found)
     catch {
         set res [string trim [exec grep $pattern $file 2> /dev/null | wc -l]]
     }
@@ -183,6 +231,9 @@ proc verify_log_message {srv_idx pattern from_line} {
 # wait for pattern to be found in server's stdout after certain line number
 # return value is a list containing the line that matched the pattern and the line number
 proc wait_for_log_messages {srv_idx patterns from_line maxtries delay} {
+    if {$::compression} {
+        set maxtries [expr {$maxtries * 3}]
+    }
     set retry $maxtries
     set next_line [expr $from_line + 1] ;# searching form the line after
     set stdout [srv $srv_idx stdout]
@@ -293,11 +344,17 @@ proc findKeyWithType {r type} {
 
 proc createComplexDataset {r ops {opt {}}} {
     set useexpire [expr {[lsearch -exact $opt useexpire] != -1}]
+    set usehexpire [expr {[lsearch -exact $opt usehexpire] != -1}]
+
     if {[lsearch -exact $opt usetag] != -1} {
         set tag "{t}"
     } else {
         set tag ""
     }
+
+    # Prepare a fieldset so we can mix in template-encoded hash keys via HIMPORT SET.
+    {*}$r himport prepare fs f0 f1 f2
+
     for {set j 0} {$j < $ops} {incr j} {
         set k [randomKey]$tag
         set k2 [randomKey]$tag
@@ -307,6 +364,35 @@ proc createComplexDataset {r ops {opt {}}} {
         if {$useexpire} {
             if {rand() < 0.1} {
                 {*}$r expire [randomKey] [randomInt 2]
+            }
+        }
+
+        # Do one random operation on one of 20 dedicated stream keys. Streams get
+        # their own keys because Redis deletes a list/set/zset/hash once its last
+        # element is gone, which frees the name to be reused as another type, while
+        # an empty stream stays. The test code never deletes such a stream, on purpose:
+        # together with strings, streams are the only type that can exist with zero
+        # elements, and they give the dataset its zero-length coverage, like the
+        # size-0 bucket of the INFO keysizes histograms. The 20 keys for streams also
+        # mean each stream gets many operations, with "*" keeping its IDs increasing.
+        if {rand() < 0.2} {
+            set sk "strm:[randomInt 20]$tag"
+            randpath {
+                {*}$r xadd $sk * $f $v
+            } {
+                {*}$r xadd $sk MAXLEN [randomInt 30] * $f $v
+            } {
+                catch {{*}$r xtrim $sk MAXLEN [randomInt 10]}
+            } {
+                catch {{*}$r xgroup create $sk g 0 MKSTREAM}
+                catch {{*}$r xreadgroup group g c count 5 streams $sk >}
+            } {
+                # Ack-and-delete the oldest entry, if any, to drive XACKDEL/PEL.
+                set first [lindex [{*}$r xrange $sk - + COUNT 1] 0 0]
+                if {$first ne {}} {
+                    catch {{*}$r xackdel $sk g IDS 1 $first}
+                    catch {{*}$r xdel $sk $first}
+                }
             }
         }
 
@@ -336,6 +422,10 @@ proc createComplexDataset {r ops {opt {}}} {
                 {*}$r zadd $k $d $v
             } {
                 {*}$r hset $k $f $v
+            } {
+                # template-encoded hash. Short/long values naturally produce 
+                # both TMPL_LP and TMPL_ARRAY encodings.
+                {*}$r himport set $k fs $v [randomValue] [randomValue]
             } {
                 {*}$r del $k
             }
@@ -386,6 +476,10 @@ proc createComplexDataset {r ops {opt {}}} {
             {hash} {
                 randpath {{*}$r hset $k $f $v} \
                         {{*}$r hdel $k $f}
+
+                if { [{*}$r hexists $k $f] && $usehexpire && rand() < 0.5} {
+                    {*}$r hexpire $k 1000 FIELDS 1 $f
+                }
             }
         }
     }
@@ -438,13 +532,30 @@ proc csvdump r {
                 hash {
                     set fields [{*}$r hgetall $k]
                     set newfields {}
-                    foreach {k v} $fields {
-                        lappend newfields [list $k $v]
+                    foreach {f v} $fields {
+                        set expirylist [{*}$r hexpiretime $k FIELDS 1 $f]
+                        if {$expirylist eq (-1)} {
+                            lappend newfields [list $f $v]
+                        } else {
+                            set e [lindex $expirylist 0]
+                            lappend newfields [list $f $e $v] # TODO: extract the actual ttl value from the list in $e
+                        }
                     }
                     set fields [lsort -index 0 $newfields]
                     foreach kv $fields {
                         append o [csvstring [lindex $kv 0]] ,
                         append o [csvstring [lindex $kv 1]] ,
+                    }
+                    append o "\n"
+                }
+                stream {
+                    # Must cover the same state as the stream
+                    # digest in xorObjectDigest() (debug.c)
+                    foreach entry [{*}$r xrange $k - +] {
+                        append o [csvstring [lindex $entry 0]] ,
+                        foreach fv [lindex $entry 1] {
+                            append o [csvstring $fv] ,
+                        }
                     }
                     append o "\n"
                 }
@@ -473,8 +584,9 @@ proc find_available_port {start count} {
             set port $start
         }
         set fd1 -1
-        if {[catch {set fd1 [socket -server 127.0.0.1 $port]}] ||
-            [catch {set fd2 [socket -server 127.0.0.1 [expr $port+10000]]}]} {
+        proc dummy_accept {chan addr port} {}
+        if {[catch {set fd1 [socket -server dummy_accept -myaddr 127.0.0.1 $port]}] ||
+            [catch {set fd2 [socket -server dummy_accept -myaddr 127.0.0.1 [expr $port+10000]]}]} {
             if {$fd1 != -1} {
                 close $fd1
             }
@@ -552,10 +664,13 @@ proc find_valgrind_errors {stderr on_termination} {
 }
 
 # Execute a background process writing random data for the specified number
-# of seconds to the specified Redis instance.
-proc start_write_load {host port seconds} {
+# of seconds to the specified Redis instance. If key is omitted, a random key
+# is used for every SET command.
+# ignore_error_reply (default 0): set non-zero in cluster slot-migration tests to tolerate
+# MOVED/ASK replies while draining pipelined writes in the load helper.
+proc start_write_load {host port seconds {key ""} {size 0} {sleep 0} {ignore_error_reply 0}} {
     set tclsh [info nameofexecutable]
-    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds $::tls &
+    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds $::tls $key $size $sleep $ignore_error_reply &
 }
 
 # Stop a process generating write load executed with start_write_load.
@@ -572,6 +687,26 @@ proc wait_load_handlers_disconnected {{level 0}} {
 }
 
 proc K { x y } { set x } 
+
+# Send count commands on a deferring client, draining replies in batches to
+# avoid TCP deadlock when deferred replies accumulate.
+proc deferred_batch {rd count cmd_script {batch_size 1000}} {
+    set pending 0
+    for {set idx 0} {$idx < $count} {incr idx} {
+        uplevel 1 [list set i $idx]
+        uplevel 1 $cmd_script
+        incr pending
+        if {$pending == $batch_size} {
+            for {set reply_idx 0} {$reply_idx < $pending} {incr reply_idx} {
+                $rd read
+            }
+            set pending 0
+        }
+    }
+    for {set reply_idx 0} {$reply_idx < $pending} {incr reply_idx} {
+        $rd read
+    }
+}
 
 # Shuffle a list with Fisher-Yates algorithm.
 proc lshuffle {list} {
@@ -602,15 +737,44 @@ proc stop_bg_complex_data {handle} {
 # Write num keys with the given key prefix and value size (in bytes). If idx is
 # given, it's the index (AKA level) used with the srv procedure and it specifies
 # to which Redis instance to write the keys.
-proc populate {num {prefix key:} {size 3} {idx 0}} {
-    set rd [redis_deferring_client $idx]
-    for {set j 0} {$j < $num} {incr j} {
-        $rd set $prefix$j [string repeat A $size]
+proc populate {num {prefix key:} {size 3} {idx 0} {prints false} {expires 0} {random false}} {
+    r $idx deferred 1
+    if {$num > 16} {set pipeline 16} else {set pipeline $num}
+    if {$random} {
+        set baseval [randstring $size $size]
+    } else {
+        set val [string repeat A $size]
     }
-    for {set j 0} {$j < $num} {incr j} {
-        $rd read
+    for {set j 0} {$j < $pipeline} {incr j} {
+        if {$random} {
+            set jstr [format "%08d" $j]
+            set val [string replace $baseval 0 7 $jstr]
+        }
+        if {$expires > 0} {
+            r $idx set $prefix$j $val ex $expires
+        } else {
+            r $idx set $prefix$j $val
+        }
+        if {$prints} {puts $j}
     }
-    $rd close
+    for {} {$j < $num} {incr j} {
+        if {$random} {
+            set jstr [format "%08d" $j]
+            set val [string replace $baseval 0 7 $jstr]
+        }
+        if {$expires > 0} {
+            r $idx set $prefix$j $val ex $expires
+        } else {
+            r $idx set $prefix$j $val
+        }
+        r $idx read
+        if {$prints} {puts $j}
+    }
+    for {set j 0} {$j < $pipeline} {incr j} {
+        r $idx read
+        if {$prints} {puts $j}
+    }
+    r $idx deferred 0
 }
 
 proc get_child_pid {idx} {
@@ -625,6 +789,75 @@ proc get_child_pid {idx} {
     close $fd
 
     return $child_pid
+}
+
+proc process_is_alive pid {
+    if {[catch {exec ps -p $pid -f} err]} {
+        return 0
+    } else {
+        if {[string match "*<defunct>*" $err]} { return 0 }
+        return 1
+    }
+}
+
+proc get_system_name {} {
+    return [string tolower [exec uname -s]]
+}
+
+proc get_proc_state {pid} {
+    if {[get_system_name] eq {sunos}} {
+        return [exec ps -o s= -p $pid]
+    } else {
+        return [exec ps -o state= -p $pid]
+    }
+}
+
+proc get_proc_job {pid} {
+    if {[get_system_name] eq {sunos}} {
+        return [exec ps -l -p $pid]
+    } else {
+        return [exec ps j $pid]
+    }
+}
+
+proc pause_process {pid} {
+    exec kill -SIGSTOP $pid
+    wait_for_condition 50 100 {
+        [string match "T*" [get_proc_state $pid]]
+    } else {
+        puts [get_proc_job $pid]
+        fail "process didn't stop"
+    }
+}
+
+proc resume_process {pid} {
+    wait_for_condition 50 1000 {
+        [string match "T*" [get_proc_state $pid]]
+    } else {
+        puts [get_proc_job $pid]
+        fail "process was not stopped"
+    }
+
+    set max_attempts 10
+    set attempt 0
+    while {($attempt < $max_attempts) && [string match "T*" [exec ps -o state= -p $pid]]} {
+        exec kill -SIGCONT $pid
+
+        incr attempt
+        after 100
+    }
+
+    set max_attempts 50
+    if {$::compression} {
+        set max_attempts 150
+    }
+    wait_for_condition $max_attempts 1000 {
+        [string match "R*" [exec ps -o state= -p $pid]] ||
+        [string match "S*" [exec ps -o state= -p $pid]]
+    } else {
+        puts [exec ps j $pid]
+        fail "process was not resumed"
+    }
 }
 
 proc cmdrstat {cmd r} {
@@ -645,7 +878,17 @@ proc latencyrstat_percentiles {cmd r} {
     }
 }
 
-proc generate_fuzzy_traffic_on_key {key duration} {
+proc get_io_thread_clients {id {client r}} {
+    set pattern "io_thread_$id:clients=(\[0-9\]+)"
+    set info [$client info threads]
+    if {[regexp $pattern $info _ value]} {
+        return $value
+    } else {
+        return -1
+    }
+}
+
+proc generate_fuzzy_traffic_on_key {key type duration} {
     # Commands per type, blocking commands removed
     # TODO: extract these from COMMAND DOCS, and improve to include other types
     set string_commands {APPEND BITCOUNT BITFIELD BITOP BITPOS DECR DECRBY GET GETBIT GETRANGE GETSET INCR INCRBY INCRBYFLOAT MGET MSET MSETNX PSETEX SET SETBIT SETEX SETNX SETRANGE LCS STRLEN}
@@ -653,10 +896,15 @@ proc generate_fuzzy_traffic_on_key {key duration} {
     set zset_commands {ZADD ZCARD ZCOUNT ZINCRBY ZINTERSTORE ZLEXCOUNT ZPOPMAX ZPOPMIN ZRANGE ZRANGEBYLEX ZRANGEBYSCORE ZRANK ZREM ZREMRANGEBYLEX ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREVRANGE ZREVRANGEBYLEX ZREVRANGEBYSCORE ZREVRANK ZSCAN ZSCORE ZUNIONSTORE ZRANDMEMBER}
     set list_commands {LINDEX LINSERT LLEN LPOP LPOS LPUSH LPUSHX LRANGE LREM LSET LTRIM RPOP RPOPLPUSH RPUSH RPUSHX}
     set set_commands {SADD SCARD SDIFF SDIFFSTORE SINTER SINTERSTORE SISMEMBER SMEMBERS SMOVE SPOP SRANDMEMBER SREM SSCAN SUNION SUNIONSTORE}
-    set stream_commands {XACK XADD XCLAIM XDEL XGROUP XINFO XLEN XPENDING XRANGE XREAD XREADGROUP XREVRANGE XTRIM}
-    set commands [dict create string $string_commands hash $hash_commands zset $zset_commands list $list_commands set $set_commands stream $stream_commands]
+    set stream_commands {XACK XADD XCLAIM XDEL XGROUP XINFO XLEN XPENDING XRANGE XREAD XREADGROUP XREVRANGE XTRIM XDELEX XACKDEL XNACK}
+    set vset_commands {VADD VREM}
+    set array_commands {ARSET ARGET ARDEL ARCOUNT ARMSET ARMGET ARGETRANGE ARDELRANGE ARINFO}
+    set commands [dict create string $string_commands hash $hash_commands zset $zset_commands list $list_commands set $set_commands stream $stream_commands vectorset $vset_commands array $array_commands]
+if 0 {
+    set gcra_commands {GCRA}
+    dict set commands gcra $gcra_commands
+}
 
-    set type [r type $key]
     set cmds [dict get $commands $type]
     set start_time [clock seconds]
     set sent {}
@@ -705,6 +953,61 @@ proc generate_fuzzy_traffic_on_key {key duration} {
             lappend cmd [randomValue]
             incr i 4
         }
+        if {$cmd == "VADD"} {
+            lappend cmd $key
+            lappend cmd VALUES 3 1 1 1
+            lappend cmd [randomValue]
+            incr i 7
+        }
+        if {$cmd == "VREM"} {
+            lappend cmd $key
+            lappend cmd [randomValue]
+            incr i 2
+        }
+        # Array commands need integer indices
+        if {$cmd == "ARSET"} {
+            lappend cmd $key
+            lappend cmd [randomInt 100000]  ;# index
+            lappend cmd [randomValue]       ;# value
+            incr i 3
+        }
+        if {$cmd == "ARGET" || $cmd == "ARDEL"} {
+            lappend cmd $key
+            lappend cmd [randomInt 100000]  ;# index
+            incr i 2
+        }
+        if {$cmd == "ARCOUNT" || $cmd == "ARINFO"} {
+            lappend cmd $key
+            incr i 1
+        }
+        if {$cmd == "ARMSET"} {
+            lappend cmd $key
+            # Add 2-4 index/value pairs
+            set npairs [expr {int(rand() * 3) + 2}]
+            for {set p 0} {$p < $npairs} {incr p} {
+                lappend cmd [randomInt 100000]
+                lappend cmd [randomValue]
+            }
+            incr i [expr {1 + $npairs * 2}]
+        }
+        if {$cmd == "ARMGET"} {
+            lappend cmd $key
+            # Add 2-4 indices
+            set nidx [expr {int(rand() * 3) + 2}]
+            for {set p 0} {$p < $nidx} {incr p} {
+                lappend cmd [randomInt 100000]
+            }
+            incr i [expr {1 + $nidx}]
+        }
+        if {$cmd == "ARGETRANGE" || $cmd == "ARDELRANGE"} {
+            lappend cmd $key
+            set idx1 [randomInt 100000]
+            set idx2 [expr {$idx1 + [randomInt 1000]}]
+            lappend cmd $idx1
+            lappend cmd $idx2
+            incr i 3
+        }
+
         for {} {$i < $arity} {incr i} {
             if {$i == $firstkey || $i == $lastkey} {
                 lappend cmd $key
@@ -721,13 +1024,20 @@ proc generate_fuzzy_traffic_on_key {key duration} {
         } else {
             set err [format "%s" $err] ;# convert to string for pattern matching
             if {[string match "*SIGTERM*" $err]} {
-                puts "command caused test to hang? $cmd"
-                exit 1
+                puts "commands caused test to hang:"
+                foreach cmd $sent {
+                    foreach arg $cmd {
+                        puts -nonewline "[string2printable $arg] "
+                    }
+                    puts ""
+                }
+                # Re-raise, let handler up the stack take care of this.
+                error $err $::errorInfo
             }
         }
     }
 
-    # print stats so that we know if we managed to generate commands that actually made senes
+    # print stats so that we know if we managed to generate commands that actually made sense
     #if {$::verbose} {
     #    set count [llength $sent]
     #    puts "Fuzzy traffic sent: $count, succeeded: $succeeded"
@@ -823,9 +1133,19 @@ proc subscribe {client channels} {
     consume_subscribe_messages $client subscribe $channels
 }
 
+proc ssubscribe {client channels} {
+    $client ssubscribe {*}$channels
+    consume_subscribe_messages $client ssubscribe $channels
+}
+
 proc unsubscribe {client {channels {}}} {
     $client unsubscribe {*}$channels
     consume_subscribe_messages $client unsubscribe $channels
+}
+
+proc sunsubscribe {client {channels {}}} {
+    $client sunsubscribe {*}$channels
+    consume_subscribe_messages $client sunsubscribe $channels
 }
 
 proc psubscribe {client channels} {
@@ -852,19 +1172,27 @@ proc debug_digest {{level 0}} {
     r $level debug digest
 }
 
-proc wait_for_blocked_client {} {
+proc wait_for_blocked_client {{idx 0}} {
     wait_for_condition 50 100 {
-        [s blocked_clients] ne 0
+        [s $idx blocked_clients] ne 0
     } else {
         fail "no blocked clients"
     }
 }
 
-proc wait_for_blocked_clients_count {count {maxtries 100} {delay 10}} {
+proc wait_for_blocked_clients_count {count {maxtries 100} {delay 10} {idx 0}} {
     wait_for_condition $maxtries $delay  {
-        [s blocked_clients] == $count
+        [s $idx blocked_clients] == $count
     } else {
-        fail "Timeout waiting for blocked clients"
+        fail "Timeout waiting for blocked clients (expected $count, actual [s $idx blocked_clients])"
+    }
+}
+
+proc wait_for_watched_clients_count {count {maxtries 100} {delay 10} {idx 0}} {
+    wait_for_condition $maxtries $delay  {
+        [s $idx watching_clients] == $count
+    } else {
+        fail "Timeout waiting for watched clients"
     }
 }
 
@@ -918,6 +1246,12 @@ proc config_set {param value {options {}}} {
     }
 }
 
+proc config_get_set {param value {options {}}} {
+    set config [lindex [r config get $param] 1]
+    config_set $param $value $options
+    return $config
+}
+
 proc delete_lines_with_pattern {filename tmpfilename pattern} {
     set fh_in [open $filename r]
     set fh_out [open $tmpfilename w]
@@ -942,7 +1276,7 @@ proc get_nonloopback_client {} {
 }
 
 # The following functions and variables are used only when running large-memory
-# tests. We avoid defining them when not running large-memory tests because the 
+# tests. We avoid defining them when not running large-memory tests because the
 # global variables takes up lots of memory.
 proc init_large_mem_vars {} {
     if {![info exists ::str500]} {
@@ -1028,4 +1362,75 @@ proc memory_usage {key} {
         set usage 1
     }
     return $usage
+}
+
+# Test if the server supports the specified command.
+proc server_has_command {cmd_wanted} {
+    set lowercase_commands {}
+    foreach cmd [r command list] {
+        lappend lowercase_commands [string tolower $cmd]
+    }
+    expr {[lsearch $lowercase_commands [string tolower $cmd_wanted]] != -1}
+}
+
+# forward compatibility, lmap missing in TCL 8.5
+proc lmap args {
+    set body [lindex $args end]
+    set args [lrange $args 0 end-1]
+    set n 0
+    set pairs [list]
+    foreach {varnames listval} $args {
+        set varlist [list]
+        foreach varname $varnames {
+            upvar 1 $varname var$n
+            lappend varlist var$n
+            incr n
+        }
+        lappend pairs $varlist $listval
+    }
+    set temp [list]
+    foreach {*}$pairs {
+        lappend temp [uplevel 1 $body]
+    }
+    set temp
+}
+
+proc format_command {args} {
+    set cmd "*[llength $args]\r\n"
+    foreach a $args {
+        append cmd "$[string length $a]\r\n$a\r\n"
+    }
+    set _ $cmd
+}
+
+# Returns whether or not the system supports stack traces
+proc system_backtrace_supported {} {
+    # Thread sanitizer reports backtrace_symbols_fd() as
+    # signal-unsafe since it allocates memory
+    if {$::tsan} {
+        return 0
+    }
+
+    set system_name [get_system_name]
+    if {$system_name eq {darwin}} {
+        return 1
+    } elseif {$system_name ne {linux}} {
+        return 0
+    }
+
+    # libmusl does not support backtrace. Also return 0 on
+    # static binaries (ldd exit code 1) where we can't detect libmusl
+    if {![catch {set ldd [exec ldd src/redis-server]}]} {
+        if {![string match {*libc.*musl*} $ldd]} {
+            return 1
+        }
+    }
+    return 0
+}
+
+proc generate_largevalue_test_array {} {
+    array set largevalue {}
+    set largevalue(listpack) "hello"
+    set largevalue(quicklist) [string repeat "x" 8192]
+    return [array get largevalue]
 }

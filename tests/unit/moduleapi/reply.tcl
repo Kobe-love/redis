@@ -1,10 +1,15 @@
 set testmodule [file normalize tests/modules/reply.so]
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
     
     #   test all with hello 2/3
     for {set proto 2} {$proto <= 3} {incr proto} {
+        if {[lsearch $::denytags "resp3"] >= 0} {
+            if {$proto == 3} {continue}
+        } elseif {$::force_resp3} {
+            if {$proto == 2} {continue}
+        }
         r hello $proto
 
         test "RESP$proto: RM_ReplyWithString: an string reply" {
@@ -26,6 +31,33 @@ start_server {tags {"modules"}} {
 
         test "RESP$proto: RM_ReplyWithDouble: a float reply" {
             assert_equal 3.141 [r rw.double 3.141]
+        }
+
+        test "RESP$proto: RM_ReplyWithDouble: inf" {
+            if {$proto == 2} {
+                assert_equal "inf" [r rw.double inf]
+                assert_equal "-inf" [r rw.double -inf]
+            } else {
+                # TCL convert inf to different results on different platforms, e.g. inf on mac
+                # and Inf on others, so use readraw to verify the protocol
+                r readraw 1
+                assert_equal ",inf" [r rw.double inf]
+                assert_equal ",-inf" [r rw.double -inf]
+                r readraw 0
+            }
+        }
+
+        test "RESP$proto: RM_ReplyWithDouble: NaN" {
+            if {$proto == 2} {
+                assert_equal "nan" [r rw.double 0 0]
+                assert_equal "nan" [r rw.double]
+            } else {
+                # TCL won't convert nan into a double, use readraw to verify the protocol
+                r readraw 1
+                assert_equal ",nan" [r rw.double 0 0]
+                assert_equal ",nan" [r rw.double]
+                r readraw 0
+            }
         }
 
         set ld 0.00000000000000001
@@ -93,6 +125,41 @@ start_server {tags {"modules"}} {
             catch {r rw.error} e
             assert_match "An error" $e
         }
+
+        test "RESP$proto: RM_ReplyWithErrorFormat: error format reply" {
+            catch {r rw.error_format "An error: %s" foo} e
+            assert_match "An error: foo" $e  ;# Should not be used by a user, but compatible with RM_ReplyError
+
+            catch {r rw.error_format "-ERR An error: %s" foo2} e
+            assert_match "-ERR An error: foo2" $e  ;# Should not be used by a user, but compatible with RM_ReplyError (There are two hyphens, TCL removes the first one)
+
+            catch {r rw.error_format "-WRONGTYPE A type error: %s" foo3} e
+            assert_match "-WRONGTYPE A type error: foo3" $e  ;# Should not be used by a user, but compatible with RM_ReplyError (There are two hyphens, TCL removes the first one)
+
+            catch {r rw.error_format "ERR An error: %s" foo4} e
+            assert_match "ERR An error: foo4" $e
+
+            catch {r rw.error_format "WRONGTYPE A type error: %s" foo5} e
+            assert_match "WRONGTYPE A type error: foo5" $e
+        }
+
+        test "RESP$proto: redis.call reply parsing with invalid CRLF character" {
+            # When Lua parses redis.call replies, the current implementation only
+            # searches for '\r' characters without verifying that '\n' follows. If a '\r'
+            # appears in the protocol data (not as part of the CRLF delimiter), the parser
+            # incorrectly treats it as a valid '\r\n' terminator.
+            #
+            # Example: Protocol data containing "\rx=100000000000" would be parsed as:
+            #   - '\rx' is treated as line terminator (should require '\r\n')
+            #   - '=100000000000' is interpreted as length specifier
+            #   - Lua attempts to create a massive string → Out of Memory
+            r deferred 1
+            r eval {return redis.call('rw.simplestring_array', '\rx=100000000000', 'hello')} 0
+            assert_equal [r rawread 30] "*2\r\n+ x=100000000000\r\n+hello\r\n"
+            r deferred 0
+        }
+
+        r hello 2
     }
 
     test "Unload the module - replywith" {

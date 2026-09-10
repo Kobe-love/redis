@@ -7,8 +7,18 @@ proc field {info property} {
     }
 }
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule log-key 0
+
+    test {module info not attempted in INFO ALL} {
+        # call INFO in a few different ways, check that regardless of the section filtering,
+        # the module isn't at all being called when unneeded.
+        r INFO
+        r INFO all
+        r INFO memory
+        set info [r info everything]
+        set calls [field $info infotest_info_calls]
+    } {1}
 
     test {module reading info} {
         # check string, integer and float fields
@@ -41,6 +51,14 @@ start_server {tags {"modules"}} {
         # info all does not contain modules
         assert { ![string match "*Spanish*" $info] }
         assert { ![string match "*infotest_*" $info] }
+        assert { [string match "*used_memory*" $info] }
+    }
+
+    test {module info all infotest} {
+        set info [r info all infotest]
+        # info all infotest should contain both ALL and the module information
+        assert { [string match "*Spanish*" $info] }
+        assert { [string match "*infotest_*" $info] }
         assert { [string match "*used_memory*" $info] }
     }
 
